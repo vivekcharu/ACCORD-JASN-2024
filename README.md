@@ -14,10 +14,10 @@ This repository contains code to reproduce the results presented in the paper
 
 ## Repo navigation
 
-- `kfre.Rmd` and `kfre.html`: Reproduces Figures 1-4, S1-S5, S9, and S12-S13 and Tables 1-2. 
-- `eGFR_slopes/eGFR_slopes.Rmd` and `eGFR_slopes/eGFR_slopes.html`: Reproduces Figures S6-S8 and Table S1. 
-- `baseline_UACR/baseline_UACR.Rmd` and `baseline_UACR/baseline_UACR.html`: Reproduces Figure S10 and Table S2. 
-- `baseline_eGFR/baseline_eGFR.Rmd` and `baseline_eGFR/baseline_eGFR.html`: Reproduces Figure S11 and Table S2. 
+- `kfre.Rmd` and `kfre.html`: Reproduce Figures 1-4, S1-S5, S9, and S12-S13 and Tables 1-2. 
+- `eGFR_slopes/eGFR_slopes.Rmd` and `eGFR_slopes/eGFR_slopes.html`: Reproduce Figures S6-S8 and Table S1. 
+- `baseline_UACR/baseline_UACR.Rmd` and `baseline_UACR/baseline_UACR.html`: Reproduce Figure S10 and Table S2. 
+- `baseline_eGFR/baseline_eGFR.Rmd` and `baseline_eGFR/baseline_eGFR.html`: Reproduce Figure S11 and Table S2. 
 
 ---
 

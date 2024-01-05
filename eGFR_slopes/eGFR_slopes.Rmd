@@ -1,0 +1,674 @@
+---
+title: "Heterogeneous Treatment Effects of Intensive Glycemic Control on Kidney Microvascular Outcomes and Mortality in ACCORD: eGFR slopes"
+author: "Vivek Charu, Jane W. Liang, Glenn M. Chertow, Zhuo Jun Li, Maria E. Montez-Rath, Pascal Geldsetzer, Ian H. de Boer, Lu Tian, and Manjula Kurella Tamura"
+output: html_document
+date: "2024-01-04"
+---
+
+```{r setup, include=FALSE}
+# Suppress messages
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(nlme)
+library(mvnfast)
+
+library(foreach)
+library(doParallel)
+
+# Cluster object
+cl = parallel::makeCluster(parallel::detectCores() - 2)
+# Register parallel backend
+registerDoParallel(cl)
+
+# Set background to be white for all ggplots
+theme_set(theme_classic())
+```
+
+## Data processing
+
+We read in the data and extract the outcome and covariate variables of interest. Duplicate observations and observations where the treatment arm or variables needed to calculate the KFRE are missing are dropped. 
+
+```{r}
+# Read in datasets
+# Raw data
+raw_data = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/Jane-Vivek/ACCORD HTE Analysis/Data/New data 26SEP2022/accordall.csv", header = TRUE)
+
+# Additional outcomes
+other_df = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/Jane-Vivek/ACCORD HTE Analysis/Data/ACCORD_GLY_NEWOUTCOMES-2.csv", header = TRUE)
+hypo_df = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/3-Data_Sets-Analysis/3a-Analysis_Data_Sets/csv/hypoglycemiatime1st.csv")
+
+# Concomitant medications
+meds_df = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/3-Data_Sets-Analysis/3a-Analysis_Data_Sets/csv/concomitantmeds.csv")
+# Classification groups for medication
+meds_groups_df = read.csv("../Copy of Meds_ACCORD.csv")[,1:2]
+names(meds_groups_df) = c("med", "group")
+
+
+# Subset for death outcomes
+other_df = other_df %>%
+  select(maskid = id, ALLDEATH, alldeath_fu, CVDEATH, cvdeath_fu)
+# Subset for 1st assisted hypoglycemic event
+hypo_df = hypo_df %>% 
+  mutate(hypoglycemia = 1 - censor_any, 
+         hypoglycemia_fu = 365 * fuyrs_any) %>% 
+  select(maskid = MaskID, hypoglycemia, hypoglycemia_fu)
+
+# Use friendlier variable names
+meds_groups_df = meds_groups_df %>% 
+  filter(group != "") %>% 
+  mutate(group = recode(group, "anti-htn" = "anti_htn", 
+                        "chol lowering" = "chol_lowering", 
+                        "oral DM" = "oral_DM"))
+# Convert data frame of classification groups to list
+con_meds = sort(unique(meds_groups_df$group))
+meds_groups_list = sapply(con_meds, function(x) {
+  meds_groups_df$med[meds_groups_df$group == x]
+})
+# Only consider baseline meds
+meds_df = meds_df %>% filter(Visit == "BLR")
+# Create a new variable for each con med classification group
+for (med in con_meds) {
+  meds_df[[med]] = 
+    rowSums(meds_df[,meds_groups_list[[med]]], na.rm = TRUE) > 0
+}
+
+
+# Merge in death outcomes
+raw_data = merge(raw_data, other_df, by = "maskid", all.x = TRUE)
+# Merge in 1st assisted hypoglycemic event
+raw_data = merge(raw_data, hypo_df, by = "maskid", all.x = TRUE)
+# Merge in con meds
+raw_data = merge(raw_data %>% select(!diuretic), 
+                 meds_df %>% select(maskid = MaskID, all_of(con_meds)), 
+                 by = "maskid", all.x = TRUE)
+
+# Create composite kidney outcome
+raw_data$neph_composite = pmax(raw_data$Neph2, raw_data$Neph3)
+raw_data$neph_composite_fu = pmin(raw_data$Neph2Days, raw_data$Neph3Days)
+
+# Quantitative variables to potentially include in the models 
+subset_quant = c("female", "baseline_age", "raceth", 
+                 "sbp", "dbp", "pulsepres",
+                 "chol", "trig", "vldl", "ldl", "hdl",
+                 "alt", "cpk",
+                 "fpg", "hba1c", 
+                 "ualb", "ucreat", "uacr", 
+                 "ckd2021GFR", "screat", 
+                 "bmi", 
+                 "smokelif", 
+                 con_meds)
+
+# List of outcome variables 
+outcome_list = list(
+  neph_composite = c(status = "neph_composite", time = "neph_composite_fu"), 
+  Neph2 = c(status = "Neph2", time = "Neph2Days"), 
+  Neph3 = c(status = "Neph3", time = "Neph3Days"), 
+  ALLDEATH = c(status = "ALLDEATH", time = "alldeath_fu"), 
+  CVDEATH = c(status = "CVDEATH", time = "cvdeath_fu"), 
+  hypoglycemia = c(status = "hypoglycemia", time = "hypoglycemia_fu"))
+# All outcomes
+outcomes = unlist(outcome_list, use.names = FALSE)
+
+# Race should be a factor
+raw_data$raceth = as.factor(raw_data$raceth)
+
+# Make relevant exclusions and define new dataset 
+df = raw_data %>% 
+  select(all_of(c("maskid", "glyarm", "kfrs", outcomes, subset_quant))) %>%
+  drop_na(all_of(c("glyarm", "kfrs"))) %>% # Drop those with missing values
+  unique() # Drop duplicates
+
+# Include race contrasts
+df = data.frame(df, 
+                raceth0 = ifelse(df$raceth == 0, 1, 0), 
+                model.matrix(~raceth, df)[,-1])
+```
+
+Read in the longitudinal lab data and calculate eGFR. 
+
+```{r}
+# Read in data
+dir = "/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/3-Data_Sets-Analysis/3a-Analysis_Data_Sets/csv/"
+activitystatus = read.csv(paste0(dir, "activitystatus.csv"))
+otherlabs = read.csv(paste0(dir, "otherlabs.csv"))
+accord_key = read.csv(paste0(dir, "accord_key.csv"))
+
+# Calculate eGFR
+calc_eGFR = function(AGE, MALE, SCR) {
+  if (length(AGE) !=  length(MALE) || 
+      length(AGE) !=  length(SCR) || 
+      length(MALE) !=  length(SCR)) {
+    warning("Input arguments are not the same length.")
+  }
+  
+  kau = 0.7*(1 - MALE) + 0.9*MALE
+  alpha = -0.241*(1 - MALE) - 0.302*MALE
+  beta = 1.012*(1 - MALE) + 1*MALE
+  
+  return(142 * pmin(SCR/kau, 1)^alpha * pmax(SCR/kau, 1)^(-1.2) * 
+           0.9938^AGE * beta)
+}
+
+# Combine otherlabs (contains serum creatinine) with activitystatus (contains 
+# FU time) and accord_key (contains age, sex, and arm)
+# Calculate eGFR and 4-month spline
+# Only include observations with 7 years and for IDs included in the main df
+egfr_df = right_join(activitystatus %>% select(MaskID, Visit, days_from_baseline), 
+                     otherlabs %>% select(MaskID, Visit, screat, gfr), 
+                     by = c("MaskID", "Visit")) %>% 
+  left_join(accord_key %>% 
+              select(MaskID, female, baseline_age, raceclass, arm, treatment), 
+            by = "MaskID") %>% 
+  mutate(treat = ifelse(arm %in% c(3, 4, 7, 8), 1, 0), 
+         baseline_age = baseline_age + days_from_baseline / 365) %>%
+  mutate(egfr = calc_eGFR(baseline_age, female == 0, screat), 
+         days_from_baseline_165 = 
+           ifelse(days_from_baseline >= 165, 165, days_from_baseline), 
+         spline = 
+           ifelse(days_from_baseline >= 165, days_from_baseline - 165, 0)) %>% 
+  filter(days_from_baseline <= 365*7, 
+         MaskID %in% df$maskid) %>% 
+  drop_na()
+```
+
+## Kidney failure risk equation (KFRE)
+
+We calculate the 5-year predicted risk using the KFRE and define KFRE quartiles. 
+
+```{r}
+# Calculate 5-year KFRE
+df$kfre5 = with(df, {
+  1 - 0.8996^exp(-0.2201 * (baseline_age/10 - 7.036) + 
+                   0.2467 * ((female==0) - 0.5642) - 
+                   0.5567 * (ckd2021GFR/5 - 7.222) + 
+                   0.4510 * ( log(uacr) - 5.137))
+})
+
+# kfre quartile thresholds
+kfre_quart_thresh = quantile(df$kfre5, seq(0.25, 0.75, by = 0.25))
+# Create groups based on thresholds
+df$kfre_quarts = as.numeric(cut(df$kfre5, 
+                                breaks = c(-Inf, as.numeric(kfre_quart_thresh), Inf),
+                                labels = c(1:(length(kfre_quart_thresh)+1))))
+
+# Merge in KFRE quartiles to long eGFR data
+egfr_df = left_join(egfr_df, df %>% select(maskid, kfre_quarts), 
+                    by = c("MaskID" = "maskid"))
+```
+
+## eGFR slopes
+
+We fit linear mixed models to the entire longitudinal eGFR dataset and within each KFRE quartile. We include a spline term at 4 months that separates the eGFR slopes into acute (before 4 months) and chronoic (after 4 months) slopes. Interactions between acute/chronic slopes and treatment and random slopes for the chronic slope and chronic slope x treatment interaction are also included. 
+
+```{r, echo = FALSE}
+load("fit_egfr.rData")
+```
+
+```{r, eval = FALSE}
+# Fit linear mixed model to eGFR with random intercepts and slopes to all patients, 
+# Include spline at 4 months
+fit_egfr = lme(egfr ~ days_from_baseline_165 * treat + spline * treat, 
+               data = egfr_df, 
+               random = ~ 1 + spline + spline:treat | MaskID)
+
+# Fit linear mixed model to eGFR with random intercepts and slopes to all 
+# patients, within each KFRS quartile
+# Include spline at 4 months
+fit_egfr_kfre_quarts = lapply(1:4, function(i) {
+  lme(egfr ~ days_from_baseline_165 * treat + spline * treat, 
+      data = egfr_df %>% filter(kfre_quarts == i), 
+      random = ~ 1 + spline + spline:treat | MaskID, 
+      control = lmeControl(opt = "optim", optimMethod = "L-BFGS-B"))
+})
+
+# Save model fits
+save(fit_egfr, fit_egfr_kfre_quarts, file = "fit_egfr.rData")
+
+# Graphical examination of model fit
+# Models by quartile look similar
+# I think these all look fine except for the tails of the Q-Q plot?
+plot(fit_egfr)
+plot(fit_egfr, MaskID ~ resid(.))
+qqnorm(resid(fit_egfr))
+```
+
+Using the slope coefficients from the model fits, we can calculate the mean eGFR slopes for the treatment and control arms, and the difference between arms. The total slope is taken as a weighted average of the acute and chronic slopes. 
+
+```{r}
+# Extract coefficients from linear mixed models
+coef_egfr = do.call(rbind, lapply(1:4, function(i) { 
+  as.data.frame(cbind(kfre_quarts = i, coef(fit_egfr_kfre_quarts[[i]])))
+}))
+
+# eGFR slopes from models fit by quartile, estimated for each individual
+slope_df = data.frame(
+  maskid = as.numeric(rownames(coef_egfr)), 
+  egfr_slope = 365 * ((4/84) * coef_egfr$`days_from_baseline_165:treat` + 
+    (80/84) * coef_egfr$`treat:spline`)
+)
+
+# Merge eGFR slopes with data frame
+df = left_join(df, slope_df, by = "maskid")
+
+# Calculate overall eGFR slope difference
+overall_egfr = mean(df$egfr_slope)
+
+# Calculate eGFR slope difference for each quartile
+kfre_quart_egfr = sapply(1:4, function(i) {
+  df_sub = df[df$kfre_quarts == i,]
+  mean(df_sub$egfr_slope)
+})
+
+# Treatment and control slopes (eGFR decline per year)
+egfr_lm_coefs = rbind(coef_egfr %>% mutate(kfre_quarts = "Overall"), coef_egfr) %>% 
+  mutate(Quartile = factor(kfre_quarts, levels = c("Overall", 1:4))) %>% 
+  group_by(Quartile) %>% 
+  summarize(
+    Treatment = mean(365 * ((4/84) * (days_from_baseline_165 + `days_from_baseline_165:treat`) + 
+                    (80/84) * (spline + `treat:spline`))), 
+    Control = mean(365 * ((4/84) * days_from_baseline_165 + (80/84) * spline)), 
+    Treatment_Spline = mean(spline + `treat:spline`), 
+    Control_Spline = mean(spline), 
+    Treatment_Slope = mean(days_from_baseline_165 + `days_from_baseline_165:treat`), 
+    Control_Slope = mean(days_from_baseline_165), 
+    Treatment_Intercept = mean(`(Intercept)` + treat), 
+    Control_Intercept = mean(`(Intercept)`)) %>% 
+  ungroup()
+egfr_lm_coefs %>% 
+  select(Quartile, Treatment, Control)
+```
+
+We summarize the number of observations/participants collected at each time point. 
+
+```{r}
+# Table with number of observations for each visit
+rbind(
+  egfr_df %>% 
+    filter(Visit != "EXIT") %>% 
+    mutate(Months = case_when(Visit == "BLR" ~ 0,
+                              TRUE ~ as.numeric(substr(Visit, 2, 3))), 
+           kfre_quarts = "0_Overall"), 
+  egfr_df %>% 
+    filter(Visit != "EXIT") %>% 
+    mutate(Months = case_when(Visit == "BLR" ~ 0,
+                              TRUE ~ as.numeric(substr(Visit, 2, 3))))) %>% 
+  group_by(Months, treat, kfre_quarts) %>%
+  summarize(n = n()) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = c(kfre_quarts, treat), 
+              values_from = n, names_sort = TRUE) %>% 
+  column_to_rownames("Months") %>%
+  t() %>% 
+  `rownames<-`(paste0(c(rep("Overall", 2), paste0("Q", rep(1:4, each = 2))), 
+                     rep(c(" (Control)", " (Treatment)"))))
+
+# Overall
+egfr_df %>% 
+  filter(Visit != "EXIT") %>% 
+  mutate(Months = case_when(Visit == "BLR" ~ 0,
+                            TRUE ~ as.numeric(substr(Visit, 2, 3)))) %>%
+  ggplot(aes(x =  Months, fill = as.factor(treat))) +
+  geom_bar(position="dodge") + 
+  scale_fill_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment")) 
+
+# By quartile
+egfr_df %>% 
+  filter(Visit != "EXIT") %>% 
+  mutate(Months = case_when(Visit == "BLR" ~ 0,
+                            TRUE ~ as.numeric(substr(Visit, 2, 3))), 
+         kfre_quarts = paste("Quartile ", kfre_quarts)) %>%
+  ggplot(aes(x =  Months, fill = as.factor(treat))) +
+  geom_bar(position="dodge") + 
+  scale_fill_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment")) + 
+  facet_wrap(~kfre_quarts)
+```
+
+We use a parametric bootstrap approach where we repeatedly sample fixed and random effects from multivariate normal distributions (based on the estimates/covariances from the fitted model) to reconstruct a sample of slopes. 
+
+```{r}
+# Number of bootstraps
+B = 1000
+
+# Number of people in each quartile
+n_kfre_quarts = as.numeric(table(df$kfre_quarts))
+# Fixed effect estimates
+fixed_eff = lapply(fit_egfr_kfre_quarts, fixed.effects)
+# Fixed and random covariance matrices
+fixed_cov_mat = lapply(fit_egfr_kfre_quarts, vcov)
+random_cov_mat = lapply(fit_egfr_kfre_quarts, getVarCov)
+
+boot_kfre_egfr = foreach::foreach(
+  b = 1:B, .packages = c("tidyverse", "mvnfast")
+  ) %dopar% {
+    # Set seed
+    set.seed(b)
+    
+    # Get data frame of slopes for each quartile
+    slopes_by_quart = do.call(
+      rbind, 
+      lapply(1:4, function(i) {
+        # Randomly generate slopes by sampling from MVN 
+        n = n_kfre_quarts[i]
+        fixed_samp = rmvn(n, mu = fixed_eff[[i]], sigma = fixed_cov_mat[[i]])
+        colnames(fixed_samp) = names(fixed_eff[[i]])
+        random_samp = rmvn(n, mu = rep(0, ncol(random_cov_mat[[i]])), 
+                           sigma = random_cov_mat[[i]])
+        colnames(random_samp) = colnames(random_cov_mat[[i]])
+        
+        # Data frame of treatment/control slopes and slope difference
+        data.frame(
+          kfre_quarts = i, 
+          egfr_slope = 
+            365 * ((4/84) * fixed_samp[,"days_from_baseline_165:treat"] + 
+                     (80/84) * (fixed_samp[,"treat:spline"] + random_samp[,"spline:treat"])), 
+          Treatment = 365 * ((4/84) * (fixed_samp[,"days_from_baseline_165"] + 
+                                        fixed_samp[,"days_from_baseline_165:treat"]) + 
+                      (80/84) * (fixed_samp[,"spline"] + random_samp[,"spline"] + 
+                                   fixed_samp[,"treat:spline"] + random_samp[,"spline:treat"])), 
+          Control = 365 * ((4/84) * fixed_samp[,"days_from_baseline_165"] + 
+                             (80/84) * (fixed_samp[,"spline"] + random_samp[,"spline"]))
+        )
+    }))
+    
+    # Calculate overall slope_df slope difference
+    overall_egfr = mean(slopes_by_quart$egfr_slope)
+
+    # Calculate eGFR slope difference for each quartile
+    kfre_quart_egfr = tapply(slopes_by_quart$egfr_slope, 
+                             slopes_by_quart$kfre_quarts, mean)
+    
+    # Slope for each treatment arm  and quartile (used for plotting)
+    egfr_lm_coefs = rbind(slopes_by_quart %>% mutate(kfre_quarts = "Overall"), 
+                          slopes_by_quart) %>% 
+      mutate(Quartile = factor(kfre_quarts, levels = c("Overall", 1:4))) %>% 
+      group_by(Quartile) %>% 
+      summarize(
+        Treatment = mean(Treatment), 
+        Control = mean(Control)) %>% 
+      ungroup()
+    
+    return(list(overall_egfr = overall_egfr, 
+                kfre_quart_egfr = kfre_quart_egfr, 
+                egfr_lm_coefs = egfr_lm_coefs))
+  }
+```
+
+We plot the eGFR trajectories over time in the treatment and control arms. 
+
+```{r}
+# Extract bootstrap treatment and control arm slope estimates
+boot_egfr_lm_coefs = abind::abind(lapply(boot_kfre_egfr, function(x) {
+  x$egfr_lm_coefs[,-1]
+}), along = 3)
+
+# Add bootstrap CIs for treatment and control slopes
+egfr_lm_coefs = cbind(
+  egfr_lm_coefs, 
+  data.frame( apply(boot_egfr_lm_coefs, c(1,2), quantile, 0.025, na.rm = TRUE)) %>% 
+    setNames(paste0(c("Treatment", "Control"), "_lo")), 
+  data.frame( apply(boot_egfr_lm_coefs, c(1,2), quantile, 0.975, na.rm = TRUE)) %>% 
+    setNames(paste0(c("Treatment", "Control"), "_hi"))) %>% 
+  mutate(treatment_label = paste0(round(Treatment, 2), "\n(", 
+                                  round(Treatment_lo, 2), ", ", 
+                                  round(Treatment_hi, 2), ")"), 
+         control_label = paste0(round(Control, 2), "\n(", 
+                                round(Control_lo, 2), ", ", 
+                                round(Control_hi, 2), ")"))
+
+# Overall
+egfr_df %>% 
+  filter(Visit != "EXIT") %>% 
+  mutate(Months = case_when(Visit == "BLR" ~ 0, 
+                            TRUE ~ as.numeric(substr(Visit, 2, 3)))) %>% 
+  group_by(Months, treat) %>% 
+  summarize(egfr = mean(egfr)) %>% 
+  ungroup() %>% 
+  mutate(slope_label = 
+           c(rep(NA, 2*(length(unique(egfr_df$Visit))-2)), 
+             egfr_lm_coefs$control_label[1], egfr_lm_coefs$treatment_label[1])) %>% 
+  ggplot(aes(x = Months, y = egfr, color = as.factor(treat))) +
+  geom_point() + geom_line() + 
+  geom_label_repel(aes(label = slope_label), size = 3, 
+                   nudge_x = 12, show.legend = FALSE, 
+                   na.rm = TRUE, segment.color = "transparent") +
+  scale_color_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment")) + 
+  ylab("Estimated GFR")
+```
+
+```{r, fig.width=10}
+# By quartile
+egfr_df %>% 
+  filter(Visit != "EXIT") %>% 
+  mutate(Months = case_when(Visit == "BLR" ~ 0, 
+                            TRUE ~ as.numeric(substr(Visit, 2, 3)))) %>% 
+  group_by(Months, treat, kfre_quarts) %>% 
+  summarize(egfr = mean(egfr)) %>% 
+  ungroup() %>% 
+  mutate(kfre_quarts = paste("Quartile ", kfre_quarts), 
+         slope_label = 
+           c(rep(NA, 4*2*(length(unique(egfr_df$Visit))-2)), 
+             egfr_lm_coefs$control_label[-1], egfr_lm_coefs$treatment_label[-1])) %>% 
+  ggplot(aes(x = Months, y = egfr, color = as.factor(treat))) +
+  geom_point() + geom_line() + 
+  geom_label_repel(aes(label = slope_label), size = 3, 
+                   nudge_x = 24,  show.legend = FALSE, 
+                   na.rm = TRUE, segment.color = "transparent") +
+  scale_color_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment")) + 
+  ylab("Estimated GFR") + 
+  facet_wrap(~kfre_quarts, scales = "free")
+```
+
+These are the same plots, but with 95% normal approximation CIs and the fitted regression line shown, instead of lines connecting the points. 
+
+```{r}
+# Overall
+egfr_df %>% 
+  filter(Visit != "EXIT") %>% 
+  mutate(Months = case_when(Visit == "BLR" ~ 0, 
+                            TRUE ~ as.numeric(substr(Visit, 2, 3)))) %>% 
+  group_by(Months, treat) %>% 
+  summarize(egfr_mean = mean(egfr), 
+            egfr_se = sd(egfr, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = Months, y = egfr_mean, color = as.factor(treat))) +
+  geom_pointrange(aes(ymin = egfr_mean - 1.96*egfr_se, 
+                      ymax = egfr_mean + 1.96*egfr_se), size = 0.25) + 
+  # Treatment spline
+  geom_segment(aes(x = 0, xend = 4, 
+                   y = egfr_lm_coefs$Treatment_Intercept[1], 
+                   yend = egfr_lm_coefs$Treatment_Intercept[1] + 
+                     4*30 * egfr_lm_coefs$Treatment_Slope[1], 
+                   color = "1"), show.legend = FALSE) + 
+  geom_segment(aes(x = 4, xend = 84, 
+                   y = egfr_lm_coefs$Treatment_Intercept[1] + 
+                     4*30 * egfr_lm_coefs$Treatment_Slope[1], 
+                   yend = egfr_lm_coefs$Treatment_Intercept[1] + 
+                     4*30 * egfr_lm_coefs$Treatment_Slope[1] + 
+                     80*30 * egfr_lm_coefs$Treatment_Spline[1], 
+                   color = "1"), show.legend = FALSE) + 
+  # Control spline
+  geom_segment(aes(x = 0, xend = 4, 
+                   y = egfr_lm_coefs$Control_Intercept[1], 
+                   yend = egfr_lm_coefs$Control_Intercept[1] + 
+                     4*30 * egfr_lm_coefs$Control_Slope[1], 
+                   color = "0"), show.legend = FALSE) + 
+  geom_segment(aes(x = 4, xend = 84, 
+                   y = egfr_lm_coefs$Control_Intercept[1] + 
+                     4*30 * egfr_lm_coefs$Control_Slope[1], 
+                   yend = egfr_lm_coefs$Control_Intercept[1] + 
+                     4*30 * egfr_lm_coefs$Control_Slope[1] + 
+                     80*30 * egfr_lm_coefs$Control_Spline[1], 
+                   color = "0"), show.legend = FALSE) + 
+  geom_label_repel(aes(x = x, y = y, label = slope_label), 
+                   data = data.frame(
+                     x = rep(90, 2), 
+                     y = c(egfr_lm_coefs$Control_Intercept[1] + 
+                             7 * egfr_lm_coefs$Control[1], 
+                           egfr_lm_coefs$Treatment_Intercept[1] + 
+                             7 * egfr_lm_coefs$Treatment[1]), 
+                     treat = c(0, 1), 
+                     slope_label = c(egfr_lm_coefs$control_label[1], 
+                                     egfr_lm_coefs$treatment_label[1])), 
+                   size = 3, nudge_x = 8, direction = "y", show.legend = FALSE, 
+                   na.rm = TRUE, segment.color = "transparent") +
+  scale_color_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment")) + 
+  ylab("Estimated GFR")
+```
+
+```{r, fig.width=10}
+# By quartile
+egfr_df %>% 
+  filter(Visit != "EXIT") %>% 
+  mutate(Months = case_when(Visit == "BLR" ~ 0, 
+                            TRUE ~ as.numeric(substr(Visit, 2, 3)))) %>% 
+  group_by(Months, treat, kfre_quarts) %>% 
+  summarize(egfr_mean = mean(egfr), 
+            egfr_se = sd(egfr, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate(kfre_quarts = paste("Quartile ", kfre_quarts)) %>% 
+  ggplot(aes(x = Months, y = egfr_mean, color = as.factor(treat))) +
+  geom_pointrange(aes(ymin = egfr_mean - 1.96*egfr_se, 
+                      ymax = egfr_mean + 1.96*egfr_se), size = 0.15) + 
+  # Treatment spline
+  geom_segment(aes(x = 0, xend = 4, 
+                   y = Treatment_Intercept, 
+                   yend = Treatment_Intercept + 
+                     4*30 * Treatment_Slope, 
+                   color = "1"), 
+               data = egfr_lm_coefs[-1,] %>% 
+                 mutate(kfre_quarts = paste("Quartile ", Quartile)), 
+               show.legend = FALSE) + 
+  geom_segment(aes(x = 4, xend = 84, 
+                   y = Treatment_Intercept + 
+                     4*30 * Treatment_Slope, 
+                   yend = Treatment_Intercept + 
+                     4*30 * Treatment_Slope + 
+                     80*30 * Treatment_Spline, 
+                   color = "1"), 
+               data = egfr_lm_coefs[-1,] %>% 
+                 mutate(kfre_quarts = paste("Quartile ", Quartile)), 
+               show.legend = FALSE) + 
+  # Control spline
+  geom_segment(aes(x = 0, xend = 4, 
+                   y = Control_Intercept, 
+                   yend = Control_Intercept + 
+                     4*30 * Control_Slope, 
+                   color = "0"), 
+               data = egfr_lm_coefs[-1,] %>% 
+                 mutate(kfre_quarts = paste("Quartile ", Quartile)), 
+               show.legend = FALSE) + 
+  geom_segment(aes(x = 4, xend = 84, 
+                   y = Control_Intercept + 
+                     4*30 * Control_Slope, 
+                   yend = Control_Intercept + 
+                     4*30 * Control_Slope + 
+                     80*30 * Control_Spline, 
+                   color = "0"), 
+               data = egfr_lm_coefs[-1,] %>% 
+                 mutate(kfre_quarts = paste("Quartile ", Quartile)), 
+               show.legend = FALSE) + 
+  geom_label_repel(aes(x = x, y = y, label = slope_label), 
+                   data = data.frame(
+                     x = rep(90, 2*4), 
+                     y = c(egfr_lm_coefs$Control_Intercept[-1] + 
+                             7 * egfr_lm_coefs$Control[-1], 
+                           egfr_lm_coefs$Treatment_Intercept[-1] + 
+                             7 * egfr_lm_coefs$Treatment[-1]), 
+                     treat = rep(c(0, 1), each = 4), 
+                     kfre_quarts = rep(paste("Quartile ", 1:4), 2), 
+                     slope_label = c(egfr_lm_coefs$control_label[-1], 
+                                     egfr_lm_coefs$treatment_label[-1])), 
+                   size = 3, nudge_x = 16, direction = "y", show.legend = FALSE, 
+                   na.rm = TRUE, segment.color = "transparent") +
+  scale_color_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment")) + 
+  ylab("Estimated GFR") + 
+  facet_wrap(~kfre_quarts, scales = "free")
+```
+
+Tables of the eGFR slope differences and normalized eGFR slope differences (where the overall eGFR slope difference is subtracted from each quartile's estimate) with 95% bootstrap CIs are shown below. 
+
+```{r}
+# Overall
+kfre_overall_egfr_boot_ci = quantile(
+  sapply(boot_kfre_egfr, function(x){
+    x$overall_egfr
+  }), c(0.025, 0.975))
+
+# Not normalized
+kfre_quart_egfr_boot_ci = sapply(1:4, function(i){
+  quantile(sapply(boot_kfre_egfr, function(x){
+    x$kfre_quart_egfr[i]
+  }), c(0.025, 0.975))
+})
+
+# Make tables
+kfre_quart_egfr_boot_tabs = rbind(
+    data.frame(Quartile = "Overall", 
+               "Est" = overall_egfr, 
+               t(kfre_overall_egfr_boot_ci)), 
+    data.frame(Quartile = 1:4, 
+               "Est" = kfre_quart_egfr, 
+               t(kfre_quart_egfr_boot_ci)))
+
+# Format table for printing
+egfr_tab = kfre_quart_egfr_boot_tabs
+rownames(egfr_tab) = NULL
+names(egfr_tab) = c("Quartile", "Est", "2.5%", "97.5%")
+egfr_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(egfr_tab[,c("Est", "2.5%", "97.5%")], 5)
+egfr_tab
+
+# Normalized (subtract overall eGFR slope difference)
+kfre_quart_egfr_norm_boot_ci = sapply(1:4, function(i){
+  quantile(sapply(boot_kfre_egfr, function(x){
+    x$kfre_quart_egfr[i] - x$overall_egfr
+  }), c(0.025, 0.975))
+})
+
+# Make tables
+kfre_quart_egfr_boot_norm_tabs = 
+  data.frame(Quartile = 1:4, 
+               "Est" = kfre_quart_egfr - overall_egfr, 
+               t(kfre_quart_egfr_norm_boot_ci))
+
+# Format table for printing
+egfr_norm_tab = kfre_quart_egfr_boot_norm_tabs
+rownames(egfr_norm_tab) = NULL
+names(egfr_norm_tab) = c("Quartile", "Est", "2.5%", "97.5%")
+egfr_norm_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(egfr_norm_tab[,c("Est", "2.5%", "97.5%")], 5)
+egfr_norm_tab
+```
+
+These are plots of the eGFR slope differences, with a horizontal reference line drawn at the overall/ATE point estimate. Shading denotes the ATE CI. 
+
+```{r}
+kfre_quart_egfr_boot_tabs[-1,] %>% 
+  mutate(x = 1:4) %>% 
+  ggplot(aes(x = x, y = as.numeric(Est))) +
+  geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+  geom_hline(data = kfre_quart_egfr_boot_tabs[1,], aes(yintercept = Est)) + 
+  geom_rect(data = kfre_quart_egfr_boot_tabs[1,], 
+            aes(x = NULL,y = NULL, 
+                xmin = -Inf, xmax = Inf, 
+                ymin = X2.5., ymax = X97.5.), 
+            alpha = 0.2) + 
+  theme(legend.position = 'bottom', legend.box = 'vertical') + 
+  xlab("Quartile") + ylab("Difference in EGFR slopes")
+```
+
+Normalized eGFR slope differences. 
+
+```{r}
+kfre_quart_egfr_boot_norm_tabs %>% 
+    mutate(x = 1:4) %>% 
+    ggplot(aes(x = x, y = as.numeric(Est))) +
+    geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+    theme(legend.position = 'bottom', legend.box = 'vertical') + 
+    xlab("Quartile") + ylab("Normalized difference in EGFR slopes") + 
+    geom_hline(yintercept = 0, color = "grey")
+```

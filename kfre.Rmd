@@ -1,0 +1,1564 @@
+---
+title: "Heterogeneous Treatment Effects of Intensive Glycemic Control on Kidney Microvascular Outcomes and Mortality in ACCORD"
+author: "Vivek Charu, Jane W. Liang, Glenn M. Chertow, Zhuo Jun Li, Maria E. Montez-Rath, Pascal Geldsetzer, Ian H. de Boer, Lu Tian, and Manjula Kurella Tamura"
+output: html_document
+date: "2024-01-04"
+---
+
+```{r setup, include=FALSE}
+# Suppress messages
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(zoo)
+library(survminer)
+
+library(survival)
+library(survRM2)
+
+library(foreach)
+library(doParallel)
+
+# Cluster object
+cl = parallel::makeCluster(parallel::detectCores() - 2)
+# Register parallel backend
+registerDoParallel(cl)
+
+# Set background to be white for all ggplots
+theme_set(theme_classic())
+```
+
+## Data processing
+
+We read in the data and extract the outcome and covariate variables of interest. Duplicate observations and observations where the treatment arm or variables needed to calculate the KFRE are missing are dropped. 
+
+```{r}
+# Read in datasets
+# Raw data
+raw_data = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/Jane-Vivek/ACCORD HTE Analysis/Data/New data 26SEP2022/accordall.csv", header = TRUE)
+
+# Additional outcomes
+other_df = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/Jane-Vivek/ACCORD HTE Analysis/Data/ACCORD_GLY_NEWOUTCOMES-2.csv", header = TRUE)
+hypo_df = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/3-Data_Sets-Analysis/3a-Analysis_Data_Sets/csv/hypoglycemiatime1st.csv")
+cvd_df = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/3-Data_Sets-Analysis/3a-Analysis_Data_Sets/csv/cvdoutcomes.csv")
+
+# Concomitant medications
+meds_df = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/3-Data_Sets-Analysis/3a-Analysis_Data_Sets/csv/concomitantmeds.csv")
+# Classification groups for medication
+meds_groups_df = read.csv("Copy of Meds_ACCORD.csv")[,1:2]
+names(meds_groups_df) = c("med", "group")
+
+
+# Subset for death outcomes
+other_df = other_df %>%
+  select(maskid = id, ALLDEATH, alldeath_fu, CVDEATH, cvdeath_fu)
+# Subset for 1st assisted hypoglycemic event
+hypo_df = hypo_df %>% 
+  mutate(hypoglycemia = 1 - censor_any, 
+         hypoglycemia_fu = 365 * fuyrs_any) %>% 
+  select(maskid = MaskID, hypoglycemia, hypoglycemia_fu)
+# Subset for CVD primary outcome
+cvd_df = cvd_df %>% 
+  mutate(cvd_primary = 1 - censor_po, 
+         cvd_primary_fu = 365 * fuyrs_po) %>% 
+  select(maskid = MaskID, cvd_primary, cvd_primary_fu)
+
+# Use friendlier variable names
+meds_groups_df = meds_groups_df %>% 
+  filter(group != "") %>% 
+  mutate(group = recode(group, "anti-htn" = "anti_htn", 
+                        "chol lowering" = "chol_lowering", 
+                        "oral DM" = "oral_DM"))
+# Convert data frame of classification groups to list
+con_meds = sort(unique(meds_groups_df$group))
+meds_groups_list = sapply(con_meds, function(x) {
+  meds_groups_df$med[meds_groups_df$group == x]
+})
+# Only consider baseline meds
+meds_df = meds_df %>% filter(Visit == "BLR")
+# Create a new variable for each con med classification group
+for (med in con_meds) {
+  meds_df[[med]] = 
+    rowSums(meds_df[,meds_groups_list[[med]]], na.rm = TRUE) > 0
+}
+
+
+# Merge in death outcomes
+raw_data = merge(raw_data, other_df, by = "maskid", all.x = TRUE)
+# Merge in 1st assisted hypoglycemic event
+raw_data = merge(raw_data, hypo_df, by = "maskid", all.x = TRUE)
+# Merge in CVD outcomes
+raw_data = merge(raw_data, cvd_df, by = "maskid", all.x = TRUE)
+# Merge in con meds
+raw_data = merge(raw_data %>% select(!diuretic), 
+                 meds_df %>% select(maskid = MaskID, all_of(con_meds)), 
+                 by = "maskid", all.x = TRUE)
+
+# Create composite kidney outcome
+raw_data$neph_composite = pmax(raw_data$Neph2, raw_data$Neph3)
+raw_data$neph_composite_fu = pmin(raw_data$Neph2Days, raw_data$Neph3Days)
+
+# Quantitative variables to potentially include in the models 
+subset_quant = c("female", "baseline_age", "raceth", 
+                 "sbp", "dbp", "pulsepres",
+                 "chol", "trig", "vldl", "ldl", "hdl",
+                 "alt", "cpk",
+                 "fpg", "hba1c", 
+                 "ualb", "ucreat", "uacr", 
+                 "ckd2021GFR", "screat", 
+                 "bmi", 
+                 "smokelif", 
+                 con_meds)
+
+# List of outcome variables 
+outcome_list = list(
+  neph_composite = c(status = "neph_composite", time = "neph_composite_fu"), 
+  Neph2 = c(status = "Neph2", time = "Neph2Days"), 
+  Neph3 = c(status = "Neph3", time = "Neph3Days"), 
+  ALLDEATH = c(status = "ALLDEATH", time = "alldeath_fu"), 
+  CVDEATH = c(status = "CVDEATH", time = "cvdeath_fu"), 
+  hypoglycemia = c(status = "hypoglycemia", time = "hypoglycemia_fu"), 
+  cvd_primary = c(status = "cvd_primary", time = "cvd_primary_fu"))
+# All outcomes
+outcomes = unlist(outcome_list, use.names = FALSE)
+
+# Race should be a factor
+raw_data$raceth = as.factor(raw_data$raceth)
+
+# Make relevant exclusions and define new dataset 
+df = raw_data %>% 
+  select(all_of(c("maskid", "glyarm", "kfrs", outcomes, subset_quant))) %>%
+  drop_na(all_of(c("glyarm", "kfrs"))) %>% # Drop those with missing values
+  unique() # Drop duplicates
+
+# Include race contrasts
+df = data.frame(df, 
+                raceth0 = ifelse(df$raceth == 0, 1, 0), 
+                model.matrix(~raceth, df)[,-1])
+```
+
+```{r}
+# Read in the longitudinal labs data and calculate eGFR. 
+dir = "/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/3-Data_Sets-Analysis/3a-Analysis_Data_Sets/csv/"
+activitystatus = read.csv(paste0(dir, "activitystatus.csv"))
+otherlabs = read.csv(paste0(dir, "otherlabs.csv"))
+accord_key = read.csv(paste0(dir, "accord_key.csv"))
+
+# Calculate eGFR
+calc_eGFR = function(AGE, MALE, SCR) {
+  if (length(AGE) !=  length(MALE) || 
+      length(AGE) !=  length(SCR) || 
+      length(MALE) !=  length(SCR)) {
+    warning("Input arguments are not the same length.")
+  }
+  
+  kau = 0.7*(1 - MALE) + 0.9*MALE
+  alpha = -0.241*(1 - MALE) - 0.302*MALE
+  beta = 1.012*(1 - MALE) + 1*MALE
+  
+  return(142 * pmin(SCR/kau, 1)^alpha * pmax(SCR/kau, 1)^(-1.2) * 
+           0.9938^AGE * beta)
+}
+
+# Combine otherlabs (contains serum creatinine) with activitystatus (contains 
+# FU time) and accord_key (contains age, sex, and arm)
+# Calculate eGFR and 6-month spline
+# Only include observations with 7 years and for IDs included in the main df
+egfr_df = right_join(activitystatus %>% select(MaskID, Visit, days_from_baseline), 
+                     otherlabs %>% select(MaskID, Visit, screat, gfr), 
+                     by = c("MaskID", "Visit")) %>% 
+  left_join(accord_key %>% 
+              select(MaskID, female, baseline_age, raceclass, arm, treatment), 
+            by = "MaskID") %>% 
+  mutate(treat = ifelse(arm %in% c(3, 4, 7, 8), 1, 0), 
+         baseline_age = baseline_age + days_from_baseline / 365) %>%
+  mutate(egfr = calc_eGFR(baseline_age, female == 0, screat), 
+         spline = ifelse(days_from_baseline >= 180, 
+                         days_from_baseline - 180, 0)) %>% 
+  filter(days_from_baseline <= 365*7, 
+         MaskID %in% df$maskid) %>% 
+  drop_na()
+
+# Create data frame for time to reduction of eGFR by 40% of baseline
+egfr40_df = left_join(
+  egfr_df %>% 
+    group_by(MaskID) %>% 
+    arrange(desc(days_from_baseline)) %>% 
+    slice(1) %>% 
+    ungroup() %>% 
+    select(MaskID, days_from_baseline), 
+  egfr_df %>% 
+    group_by(MaskID) %>% 
+    arrange(days_from_baseline) %>% 
+    mutate(egfr40_cumsum = cumsum(egfr <= egfr[days_from_baseline == 0] * 0.6), 
+           egfr40_consec_sum = rollsum(egfr <= egfr[days_from_baseline == 0] * 0.6, 
+                                       k = 2, na.pad = TRUE,  align = "right")) %>% 
+    summarize(
+      # 40% eGFR reduction for 2 consecutive measures
+      egfr40_2consec = as.numeric(any(egfr40_consec_sum == 2, na.rm = TRUE)),
+      egfr40_2consec_fu = first(days_from_baseline[egfr40_consec_sum == 2], 
+                                na_rm = TRUE)) %>% 
+    ungroup(), 
+  by = "MaskID") %>% 
+  rename(maskid = MaskID) %>% 
+  mutate(egfr40_2consec = replace_na(egfr40_2consec, 0), 
+         egfr40_2consec_fu = coalesce(egfr40_2consec_fu, days_from_baseline))
+
+# Merge in event status and time to reduction of eGFR by 40% of baseline
+df = left_join(df, egfr40_df, by = "maskid") 
+
+# Create composite out for first occurrence of 40% eGFR reduction or Neph3
+# 40% eGFR reduction for 2 consecutive measures
+df$egfr40_2consec = pmax(df$egfr40_2consec, df$Neph3)
+df$egfr40_2consec_fu = pmin(df$egfr40_2consec_fu, df$Neph3Days)
+  
+# List of outcome variables 
+outcome_list = c(
+  outcome_list, 
+  list(egfr40_2consec = c(status = "egfr40_2consec", time = "egfr40_2consec_fu")))
+# All outcomes
+outcomes = unlist(outcome_list, use.names = FALSE)
+```
+
+We define a data frame that standardizes all continuous variables to have mean 0 and standard deviation 1. 
+
+```{r}
+# All covariates considered + race split into contrasts
+expanded_covariates = c(setdiff(subset_quant, "raceth"), 
+                        paste0("raceth", 0:3))
+# Binary variables
+binary_vars = apply(df[,expanded_covariates], 2, function(x){
+  length(unique(x)) == 2 && all(sort(unique(x)) == c(0, 1))
+})
+
+# Data where continuous covariates are standardized
+# Binary variables are left alone
+std_df = sapply(1:length(expanded_covariates), function(i) {
+  if (binary_vars[i] == FALSE) {
+    return(scale(df[,expanded_covariates][,i]))
+  } else {
+    return(df[,expanded_covariates][,i])
+  }
+})
+colnames(std_df) = expanded_covariates
+```
+
+## Kidney failure risk equation (KFRE)
+
+We calculate the 5-year predicted risk using the KFRE, define KFRE quartiles, and plot the distributions within treatment arms. 
+
+```{r}
+# Calculate 5-year KFRE
+df$kfre5 = with(df, {
+  1 - 0.8996^exp(-0.2201 * (baseline_age/10 - 7.036) + 
+                   0.2467 * ((female==0) - 0.5642) - 
+                   0.5567 * (ckd2021GFR/5 - 7.222) + 
+                   0.4510 * ( log(uacr) - 5.137))
+})
+
+# kfre quartile thresholds
+kfre_quart_thresh = quantile(df$kfre5, seq(0.25, 0.75, by = 0.25))
+# Create groups based on thresholds
+df$kfre_quarts = as.numeric(cut(df$kfre5, 
+                                breaks = c(-Inf, as.numeric(kfre_quart_thresh), Inf),
+                                labels = c(1:(length(kfre_quart_thresh)+1))))
+
+# Histograms of KFRE for treatment and control
+df %>% 
+  ggplot(aes(x = kfre5, fill = as.factor(glyarm), color = as.factor(glyarm))) + 
+  geom_histogram(alpha = 0.3, position="identity") + 
+  scale_x_log10(breaks = 10^(-6:0), 
+                labels = function(x) paste0(formatC(x*100, format = "fg"), "%")) + 
+  geom_vline(xintercept = kfre_quart_thresh, color = "gray60") + 
+  geom_text(data = data.frame(kfre_quart_thresh = kfre_quart_thresh), 
+             aes(x = kfre_quart_thresh, y = Inf, 
+                 label = sprintf("%1.3f%%", 100*kfre_quart_thresh)), 
+             inherit.aes = FALSE, color = "grey60", 
+            hjust = 1.1, vjust = 1.4, size = 3, angle = 90) + 
+  xlab("5-year predicted risk by KFRE (log)") + ylab("") + 
+  scale_fill_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment")) + 
+  scale_color_discrete(name = "", labels = c("0" = "Control", "1" = "Treatment"))
+ggsave("figs_and_tabs/kfre_hist.png", width = 6, height = 4)
+
+# General summary function that returns the mean, standard deviation, median 
+# and IQR of x
+my_summary = function(x, na.rm = TRUE) {
+  c("Mean" = mean(x, na.rm = na.rm), 
+    "SD" = sd(x, na.rm = na.rm), 
+    "Median" = median(x, na.rm = na.rm), 
+    "IQR" = IQR(x, na.rm = na.rm))
+}
+
+# Distribution of KFRE for treatment and control
+kfre_dist_tab = data.frame(
+  do.call(rbind, c(list(my_summary(df$kfre5)), 
+                 tapply(df$kfre5, df$glyarm, my_summary))), 
+  row.names = c("Overall", "Control", "Treatment")
+)
+write.csv(kfre_dist_tab %>% round(5), file = "figs_and_tabs/kfre_dist_tab.csv")
+kfre_dist_tab %>% round(5)
+```
+
+These are summary statistics for the scores within each KFRE quartile. 
+
+```{r}
+# Summary stats for KFRE within quartile
+kfre_quart_tab = data.frame(do.call(rbind, 
+        lapply(1:4, function(i) {
+          c(Quartile = i, 
+            my_summary(df$kfre5[df$kfre_quarts==i]))
+        })
+))
+write.csv(kfre_quart_tab %>% round(5), 
+          file = "figs_and_tabs/kfre_quart_tab.csv", row.names = FALSE)
+kfre_quart_tab %>% round(5)
+```
+
+Number of observations overall and in each arm. 
+
+```{r}
+c(table(raw_data$glyarm), Overall = nrow(raw_data))
+```
+
+Number of observations overall and in each arm, restricting to those with non-missing covariates needed to calculate KFRE. 
+
+```{r}
+c(table(df$glyarm), Overall = nrow(df))
+```
+
+Number of non-missing observations for each outcome. 
+
+```{r}
+t(sapply(outcome_list, function(x) {
+  my_df = na.omit(df[,c(x["status"], x["time"], "glyarm")])
+  c(table(my_df$glyarm), Overall = nrow(my_df))
+}))
+```
+
+## Descriptive statistics
+
+For each quartile and overall, we report the proportion (standard deviation) for all binary variables and the median (IQR) of all continuous variables in the dataset. 
+
+```{r}
+# Data dictionary for nice variable names
+dat_dict = data.frame(rbind(
+  c("female", "Female gender", "(yes/no)"), 
+  c("raceth0", "White", "(yes/no)"), 
+  c("raceth1", "Black", "(yes/no)"), 
+  c("raceth3", "Hispanic", "(yes/no)"), 
+  c("raceth2", "Other race/ethnicity", "(yes/no)"), 
+  c("baseline_age", "Baseline age", "(years)"), 
+  c("bmi", "Body mass index", "(kg/m2)"), 
+  c("sbp", "Systolic blood pressure", "(mmHg)"), 
+  c("dbp", "Diastolic blood pressure", "(mmHg)"), 
+  c("pulsepres", "Pulse pressure", "(mmHg)"), 
+  c("chol", "Total cholesterol", "(mg/dL)"), 
+  c("trig", "Triglyercides", "(mg/dL)"), 
+  c("vldl", "Very low density lipoprotein", "(mg/dL)"), 
+  c("ldl", "Low density lipoprotein", "(mg/dL)"), 
+  c("hdl", "High density lipoprotein", "(mg/dL)"), 
+  c("alt", "Alanine aminotransferase", "(mg/dL)"), 
+  c("cpk", "Creatine phosphokinase", "(mg/dL)"), 
+  c("fpg", "Fasting plasma glucose", "(mg/dL)"), 
+  c("hba1c", "Glycosylated hemoglobin", "(%)"), 
+  c("ualb", "Urinary albumin", "(mg/dL)"), 
+  c("ucreat", "Urinary creatinine", "(mg/dL)"), 
+  c("uacr", "Urinary albumin to creatinine ratio", "(mg/g)"), 
+  c("ckd2021GFR", "Estimated glomerular filtration rate", "(mL/min/1.73m2)"), 
+  c("screat", "Serum creatinine", "(mg/dL)"),  
+  c("anti_htn", "Anti-hypertension medication", "(yes/no)"), 
+  c("chol_lowering", "Cholesterol-lowering medication", "(yes/no)"), 
+  c("diuretic", "Diuretic medication", "(yes/no)"), 
+  c("insulin", "Insulin", "(yes/no)"), 
+  c("oral_DM", "Oral diabetes medication", "(yes/no)"), 
+  c("neph_composite", "Composite kidney outcome", "(yes/no)"), 
+  c("Neph2", "Development of macro-albuminuria", "(yes/no)"), 
+  c("Neph3", "Renal failure or ESRD (dialysis) or SCr>3.3", "(yes/no)"), 
+  c("ALLDEATH", "All cause death", "(yes/no)"), 
+  c("CVDEATH", "Cardiovascular death", "(yes/no)"), 
+  c("hypoglycemia", "1st assisted hypoglycemic event", "(yes/no)"), 
+  c("egfr40_2consec", "ESRD or sustained (consecutive) eGFR reduction of 40%", "(yes/no)")
+))
+names(dat_dict) = c("short", "long", "units")
+
+# Center (median or mean) of each variable
+center_tab = cbind(
+  # Overall
+  sapply(c(expanded_covariates, names(outcome_list)), function(var) {
+    if (var %in% c("glyarm", names(outcome_list), 
+                   names(binary_vars)[binary_vars])) { # Binary variables
+      mean(df[,var], na.rm = TRUE)
+    } else { # Continuous
+      median(df[,var], na.rm = TRUE)
+    }
+  }), 
+  # By quartile
+  sapply(1:4, function(i) {
+    sapply(c(expanded_covariates, names(outcome_list)), function(var) {
+      if (var %in% c("glyarm", names(outcome_list), 
+                     names(binary_vars)[binary_vars])) { # Binary variables
+        mean(df[df$kfre_quarts==i,var], na.rm = TRUE)
+      } else { # Continuous
+        median(df[df$kfre_quarts==i,var], na.rm = TRUE)
+      }
+    })
+  })
+)
+
+# Spread (IQR or standard deviation) of each variable
+spread_tab = cbind(
+  # Overall
+  sapply(c(expanded_covariates, names(outcome_list)), function(var) {
+    if (var %in% c("glyarm", names(outcome_list), 
+                   names(binary_vars)[binary_vars])) { # Binary variables
+      sd(df[,var], na.rm = TRUE)
+    } else { # Continuous
+      IQR(df[,var], na.rm = TRUE)
+    }
+  }), 
+  # By quartile
+  sapply(1:4, function(i){
+    sapply(c(expanded_covariates, names(outcome_list)), function(var) {
+      if (var %in% c("glyarm", names(outcome_list), 
+                     names(binary_vars)[binary_vars])) { # Binary variables
+        sd(df[df$kfre_quarts==i,var], na.rm = TRUE)
+      } else { # Continuous
+        IQR(df[df$kfre_quarts==i,var], na.rm = TRUE)
+      }
+    })
+  })
+)
+
+# Number of non-missing values for each covariate
+N_tab = sapply(c(expanded_covariates, names(outcome_list)), function(var) {
+  sum(!is.na(df[,var]))
+})
+
+# Create Table 1
+tab1 = matrix(paste0(round(center_tab, 2), " (", round(spread_tab, 2), ")"), 
+              nrow = nrow(center_tab), ncol = 5)
+rownames(tab1) = rownames(center_tab)
+colnames(tab1) = c("Overall", paste("Quartile", 1:4))
+tab1 = cbind(tab1, N = N_tab)
+
+# Use more descriptive variable names
+tab1 = merge(dat_dict, tab1, by.x = "short", by.y = 0, sort = FALSE)
+rownames(tab1) = paste(tab1$long, tab1$units)
+tab1$short = NULL; tab1$long = NULL; tab1$units = NULL
+write.csv(tab1, file = "figs_and_tabs/tab1.csv")
+tab1
+```
+
+## Balance between treatment and control arm within quartile
+
+To check the balance between the treatment and control groups, we take the difference in standardized means for each covariate, within each treatment arm and quartile. 
+
+```{r}
+# Mean of each covariate across individuals within each quartile and treatment 
+# group, for kfirs
+# Standardized means were used for continuous covariates
+std_means_balance_kfre = lapply(expanded_covariates, function(var) {
+  tapply(std_df[,var], list(df$kfre_quarts, df$glyarm), 
+         mean, na.rm = TRUE)
+})
+names(std_means_balance_kfre) = expanded_covariates
+
+# Split into treatment and control
+# Treatment
+std_means_trt_kfre = sapply(expanded_covariates, function(var){
+  std_means_balance_kfre[[var]][,"1"]
+}) %>% t()
+
+# Control
+std_means_control_kfre = sapply(expanded_covariates, function(var){
+  std_means_balance_kfre[[var]][,"0"]
+}) %>% t()
+
+# Difference between treatment and control
+std_means_diff_kfre = 
+  merge(dat_dict, 
+        sapply(expanded_covariates, function(var){
+          std_means_balance_kfre[[var]][,"1"] - 
+            std_means_balance_kfre[[var]][,"0"]
+          }) %>% t(), 
+        by.x = "short", by.y = 0, sort = FALSE)
+rownames(std_means_diff_kfre) = std_means_diff_kfre$long
+std_means_diff_kfre = std_means_diff_kfre[,-c(1:3)]
+```
+
+We plot the mean difference between treatment and control for each variable, within each quartile. 
+
+```{r}
+data.frame(est = gather(data.frame(std_means_diff_kfre))$value, 
+           Quartile = rep(as.factor(1:4), each = nrow(std_means_diff_kfre))) %>% 
+  mutate(y = rep(1:nrow(std_means_diff_kfre), 4) + 
+           rep(seq(-0.2, 0.2, length = 4), each = nrow(std_means_diff_kfre))) %>% 
+  ggplot(aes(x = as.numeric(est), y = y, color = Quartile)) +
+  geom_point() + 
+  scale_color_manual(values = c("navy", "dodgerblue", "mediumpurple","firebrick")) + 
+  scale_y_continuous(breaks = 1:nrow(std_means_diff_kfre), 
+                     labels = rownames(std_means_diff_kfre), 
+                     expand = c(0.02, 0.02)) + 
+  xlab("Difference in standardized mean between treatment and control") + ylab("") + 
+  ggtitle("Imbalance by KFRE quartile")
+ggsave("figs_and_tabs/kfre_imbalance.png", width = 6, height = 5)
+
+write.csv(std_means_diff_kfre %>% round(3), 
+          file = "figs_and_tabs/std_means_diff_kfre.csv")
+std_means_diff_kfre %>% round(3)
+```
+
+No covariates were imbalanced (defined as the mean difference between treatment and control being greater than 0.1 for at least one quartile), so we will not run an adjusted analysis. 
+
+```{r}
+# Which variables are imbalanced by more than 0.05 standard units?
+is_imbalanced = apply(std_means_diff_kfre, 1, function(x){
+  any(abs(x) > 0.1)
+})
+
+imbalanced_vars = dat_dict$short[which(dat_dict$long %in%
+                                         names(is_imbalanced)[is_imbalanced])]
+imbalanced_vars
+```
+
+## Treatment effects
+
+We estimate the 7-year RMST differences for each subgroup defined by the KFRE quartiles. 
+
+```{r}
+# Horizon
+horizon = 365*7
+
+# RMST difference overall
+overall_rmst_fits = lapply(outcome_list, function(x){
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+      if (x["status"] == "egfr40_2consec") {
+        horizon = 2525 
+      } else {
+        horizon = 365*7
+      }
+  rmst2(df_sub[,x["time"]], 
+        df_sub[,x["status"]], 
+        df_sub[,"glyarm"], 
+        tau = horizon)
+})
+names(overall_rmst_fits) = names(outcome_list)
+overall_rmst = sapply(names(outcome_list), function(outcome){
+  overall_rmst_fits[[outcome]]$unadjusted.result[1,1]
+})
+
+# RMST difference by quartile
+kfre_quart_rmst_fits = lapply(outcome_list, function(x){
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+  lapply(1:4, function(i){
+    rmst2(df_sub[df_sub$kfre_quarts==i,x["time"]], 
+          df_sub[df_sub$kfre_quarts==i,x["status"]], 
+          df_sub[df_sub$kfre_quarts==i,"glyarm"], 
+          tau = horizon)
+  })
+})
+names(kfre_quart_rmst_fits) = names(outcome_list)
+kfre_quart_rmst = sapply(names(outcome_list), function(outcome){
+  sapply(1:4, function(i){
+    kfre_quart_rmst_fits[[outcome]][[i]]$unadjusted.result[1,1]
+  })
+})
+```
+
+We use 1000 bootstrap samples to obtain confidence intervals for the RMST differences. Tables of the RMST differences and normalized RMST differences (where the overall RMST difference is subtracted from each quartile's estimate) with 95% bootstrap CIs are shown below. 
+
+```{r}
+# Number of bootstraps/permutations
+B = 1000
+```
+
+```{r, echo = FALSE}
+load("boot_kfre_rmst.rData")
+```
+
+```{r, eval = FALSE}
+boot_kfre_rmst = foreach::foreach(
+  b = 1:B, 
+  .packages = c("survRM2")
+  ) %dopar% {
+    # Set seed
+    set.seed(b)
+    # Create bootstrap sample
+    boot_idx = sample(nrow(df), replace= TRUE)
+    df_boot = df[boot_idx,]
+    
+    # Calculate overall RMST difference
+    overall_rmst = sapply(outcome_list, function(x){
+      df_sub = na.omit(df_boot[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+      rmst2(df_sub[,x["time"]], 
+            df_sub[,x["status"]], 
+            df_sub[,"glyarm"], 
+            tau = horizon)$unadjusted.result[1,1]
+      })
+    
+    # Calculate RMST difference for each quartile
+    kfre_quart_rmst = sapply(outcome_list, function(x){
+      df_sub = na.omit(df_boot[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+      if (x["status"] == "egfr40_2consec") {
+        horizon = 2525 
+      } else {
+        horizon = 365*7
+      }
+      sapply(1:4, function(i){
+        rmst2(df_sub[df_sub$kfre_quarts==i,x["time"]], 
+              df_sub[df_sub$kfre_quarts==i,x["status"]], 
+              df_sub[df_sub$kfre_quarts==i,"glyarm"], 
+              tau = horizon)$unadjusted.result[1,1]
+      })
+    })
+    return(list(overall_rmst = overall_rmst, 
+                kfre_quart_rmst = kfre_quart_rmst))
+  }
+
+save(boot_kfre_rmst, file = "boot_kfre_rmst.rData")
+```
+
+```{r}
+# Overall
+kfre_overall_rmst_boot_ci = apply(
+  sapply(boot_kfre_rmst, function(x){
+    x$overall_rmst
+  }), 1, quantile, c(0.025, 0.975))
+
+# Not normalized
+kfre_quart_rmst_boot_ci = lapply(1:4, function(i){
+  dat = sapply(boot_kfre_rmst, function(x){
+    x$kfre_quart_rmst[i,]
+  })
+  apply(dat, 1, quantile, c(0.025, 0.975))
+})
+
+# Make tables
+kfre_quart_rmst_boot_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Quartile = "Overall", 
+               "Est" = overall_rmst[outcome], 
+               t(kfre_overall_rmst_boot_ci[,outcome])), 
+    data.frame(Quartile = 1:4, 
+               "Est" = kfre_quart_rmst[,outcome], 
+               t(sapply(kfre_quart_rmst_boot_ci, function(x){x[,outcome]}))))
+  rownames(out) = NULL
+  return(out)
+})
+names(kfre_quart_rmst_boot_tabs) = names(outcome_list)
+
+# Format table for printing
+rmst_tab = data.frame(
+  Outcome = rep(names(kfre_quart_rmst_boot_tabs), 
+                each = nrow(kfre_quart_rmst_boot_tabs[[1]])), 
+  do.call(rbind, kfre_quart_rmst_boot_tabs), 
+  row.names = NULL
+)
+rmst_tab = merge(dat_dict[,c("short", "long")], rmst_tab, 
+                 by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                 sort = FALSE)[,-1]
+names(rmst_tab) = c("Outcome", "Quartile", "Est", "2.5%", "97.5%")
+rmst_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(rmst_tab[,c("Est", "2.5%", "97.5%")], 2)
+write.csv(rmst_tab, 
+          file = "figs_and_tabs/rmst_tab.csv", row.names = FALSE)
+rmst_tab
+
+# Normalized (subtract overall RMST difference)
+kfre_quart_rmst_norm_boot_ci = lapply(1:4, function(i){
+  dat = sapply(boot_kfre_rmst, function(x){
+    x$kfre_quart_rmst[i,] - x$overall_rmst
+  })
+  apply(dat, 1, quantile, c(0.025, 0.975))
+})
+
+# Make tables
+kfre_quart_rmst_boot_norm_tabs = lapply(names(outcome_list), function(outcome){
+  data.frame(Quartile = 1:4, 
+               "Est" = kfre_quart_rmst[,outcome] - overall_rmst[outcome], 
+               t(sapply(kfre_quart_rmst_norm_boot_ci, function(x){x[,outcome]})))
+})
+names(kfre_quart_rmst_boot_norm_tabs) = names(outcome_list)
+
+# Format table for printing
+rmst_norm_tab = data.frame(
+  Outcome = rep(names(kfre_quart_rmst_boot_norm_tabs), 
+                each = nrow(kfre_quart_rmst_boot_norm_tabs[[1]])), 
+  do.call(rbind, kfre_quart_rmst_boot_norm_tabs), 
+  row.names = NULL
+)
+rmst_norm_tab = merge(dat_dict[,c("short", "long")], rmst_norm_tab, 
+                      by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                      sort = FALSE)[,-1]
+names(rmst_norm_tab) = c("Outcome", "Quartile", "Est", "2.5%", "97.5%")
+rmst_norm_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(rmst_norm_tab[,c("Est", "2.5%", "97.5%")], 2)
+write.csv(rmst_norm_tab, 
+          file = "figs_and_tabs/rmst_norm_tab.csv", row.names = FALSE)
+rmst_norm_tab
+```
+
+These are plots of the RMST differences by outcome, with a horizontal reference line drawn at the overall/ATE point estimate. Shading denotes the ATE CI. 
+
+```{r}
+for (outcome in names(kfre_quart_rmst_boot_tabs)) {
+  ate_tab = kfre_quart_rmst_boot_tabs[[outcome]][1,]
+  p1 = kfre_quart_rmst_boot_tabs[[outcome]][-1,] %>% 
+    mutate(x = 1:4) %>% 
+    ggplot(aes(x = x, y = as.numeric(Est))) +
+    geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+    geom_hline(yintercept = ate_tab[,"Est"], color = "grey") + 
+    annotate("rect", xmin = -Inf, xmax = Inf, 
+             ymin = ate_tab[,"X2.5."], ymax = ate_tab[,"X97.5."], 
+             alpha = 0.2) + 
+    scale_x_continuous(breaks = 1:4, labels = 1:4) + 
+    theme(legend.position = 'bottom', legend.box = 'vertical') + 
+    xlab("Quartile") + ylab("RMST difference") +
+    ggtitle(dat_dict$long[which(dat_dict$short == outcome)])
+  print(p1)
+  ggsave(paste0("figs_and_tabs/rmst_", outcome, ".png"), 
+         width = 6, height = 4)
+}
+```
+
+Normalized RMST differences. 
+
+```{r}
+for (outcome in names(kfre_quart_rmst_boot_norm_tabs)) {
+  p1 = kfre_quart_rmst_boot_norm_tabs[[outcome]] %>% 
+    mutate(x = 1:4) %>% 
+    ggplot(aes(x = x, y = as.numeric(Est))) +
+    geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+    scale_x_continuous(breaks = 1:4, labels = 1:4) + 
+    theme(legend.position = 'bottom', legend.box = 'vertical') + 
+    xlab("Quartile") + ylab("Normalized RMST difference") + 
+    geom_hline(yintercept = 0, color = "grey") + 
+    ggtitle(dat_dict$long[which(dat_dict$short == outcome)])
+  print(p1)
+  ggsave(paste0("figs_and_tabs/rmst_norm_", outcome, ".png"), 
+         width = 6, height = 4)
+}
+```
+
+## Cox PH models and cumulative incidence curves
+
+For each outcome, we fit a Cox PH model to treatment for the entire dataset and each group defined by the KFRE quartiles. Estimates of the treatment hazard ratios are shown below.  
+
+```{r}
+# Fit Cox PH model for each outcome to glyarm
+coxph_fits = lapply(names(outcome_list), function(outcome){
+  # Extract data of interest
+  x = outcome_list[[outcome]]
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm")])
+  
+  # Formula for survfit object
+  form = formula(paste0("Surv(", x["time"], ", " , 
+                        x["status"], ") ~ glyarm"))
+  # Fit survfit object
+  fit = coxph(form, data = df_sub)
+  # Manually insert formula
+  fit$call$formula = form
+  
+  return(fit)
+})
+names(coxph_fits) = names(outcome_list)
+
+# Fit Cox PH models within quartile
+coxph_fits_by_quart = lapply(names(outcome_list), function(outcome){
+  # Extract data of interest
+  x = outcome_list[[outcome]]
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+  
+  # Formula for survfit object
+  form = formula(paste0("Surv(", x["time"], ", " , 
+                        x["status"], ") ~ glyarm"))
+  
+  all_fits = lapply(1:4, function(i){
+    # Subset data to quartile
+    df_sub = df_sub[df_sub$kfre_quarts==i, ]
+    
+    # Fit survfit object
+    fit = coxph(form, data = df_sub)
+    # Manually insert formula
+    fit$call$formula = form
+    
+    return(fit)
+  })
+  
+  return(all_fits)
+})
+names(coxph_fits_by_quart) = names(outcome_list)
+
+# Make tables
+coxph_coeff_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Quartile = "Overall", 
+               t(exp(c(coef(coxph_fits[[outcome]]), confint(coxph_fits[[outcome]]))))
+               ), 
+    data.frame(Quartile = 1:4, 
+               do.call(rbind, 
+                       lapply(coxph_fits_by_quart[[outcome]], function(x){
+                         exp(c(coef(x), confint(x)))
+                         }))
+               ))
+  rownames(out) = NULL
+  colnames(out) = c("Quartile", "Est", "X2.5.", "X97.5.")
+  return(out)
+})
+names(coxph_coeff_tabs) = names(outcome_list)
+
+# Format table for printing
+coeff_tab = data.frame(
+  Outcome = rep(names(coxph_coeff_tabs), 
+                each = nrow(coxph_coeff_tabs[[1]])), 
+  do.call(rbind, coxph_coeff_tabs), 
+  row.names = NULL
+)
+coeff_tab = merge(dat_dict[,c("short", "long")], coeff_tab, 
+                  by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                  sort = FALSE)[,-1]
+names(coeff_tab) = c("Outcome", "Quartile", "Est", "2.5%", "97.5%")
+coeff_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(coeff_tab[,c("Est", "2.5%", "97.5%")], 2)
+write.csv(coeff_tab, 
+          file = "figs_and_tabs/coeff_tab.csv", row.names = FALSE)
+coeff_tab
+```
+
+We plot cumulative incidence curves and risk tables for each outcome. 
+
+```{r, fig.width = 6, fig.height = 6}
+# Fit Kaplan-Meier survival curves for each outcome to glyarm
+km_fits = lapply(names(outcome_list), function(outcome){
+  # Extract data of interest
+  x = outcome_list[[outcome]]
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+  
+  # Formula for survfit object
+  form = formula(paste0("Surv(", x["time"], ", " , 
+                        x["status"], ") ~ glyarm"))
+  # Fit survfit object
+  fit = survfit(form, data = df_sub)
+  # Manually insert formula
+  fit$call$formula = form
+  
+  return(fit)
+})
+names(km_fits) = names(outcome_list)
+
+# Helper function for formatting labels of the form est (lo, hi)
+est_with_ci_text = function(x, est = "Est", lo = "X2.5.", hi = "X97.5.", 
+                            digits = 2) {
+  x = round(x[c(est, lo, hi)], 2)
+  paste0(x[est], " (", x[lo], ", ", x[hi], ")")
+}
+
+invisible(lapply(names(outcome_list), function(outcome){
+  # Extract data of interest
+  x = outcome_list[[outcome]]
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+  
+  # Plot cumulative incidence curve with risk table
+  if (outcome == "egfr40_2consec") {
+    outcome_title = "ESRD or sustained (consecutive) \neGFR reduction of 40%"
+  } else {
+    outcome_title = dat_dict$long[which(dat_dict$short == outcome)]
+  }
+  p1 = ggsurvplot(km_fits[[outcome]], data = df_sub, censor = FALSE, 
+                  title = outcome_title, 
+                  conf.int = TRUE, risk.table = TRUE, fun = "event", 
+                  legend.labs = c("Control", "Treatment"))
+  # Create annotation for hazard ratio and 7-year RMST
+  p1$plot = p1$plot + 
+    annotate("label", x = 0, y = Inf, vjust = 1, hjust = 0, 
+             size = 4, fontface = 2, 
+             label = paste0("HR = ", 
+                            est_with_ci_text(coxph_coeff_tabs[[outcome]][1,-1]), 
+                            "\n7-year RMST difference\n   = ", 
+                            est_with_ci_text(kfre_quart_rmst_boot_tabs[[outcome]][1,-1])))
+  
+  png(paste0("figs_and_tabs/cum_inc_", outcome, ".png"), 
+      res = 100, width = 600, height = 600)
+  print(p1)
+  dev.off()
+  print(p1)
+}))
+```
+
+We plot cumulative incidence curves for each outcome, faceted by quartile. 
+
+```{r, fig.width = 10, fig.height = 10, message = FALSE, warning = FALSE}
+# Fit Kaplan-Meier survival curves within quartile
+km_fits_by_quart = lapply(names(outcome_list), function(outcome){
+  # Extract data of interest
+  x = outcome_list[[outcome]]
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+  
+  # Formula for survfit object
+  form = formula(paste0("Surv(", x["time"], ", " , 
+                        x["status"], ") ~ glyarm"))
+  
+  all_fits = lapply(1:4, function(i){
+    # Subset data to quartile
+    df_sub = df_sub[df_sub$kfre_quarts==i, ]
+    
+    # Fit survfit object
+    fit = survfit(form, data = df_sub)
+    # Manually insert formula
+    fit$call$formula = form
+    
+    return(fit)
+  })
+  
+  return(all_fits)
+})
+names(km_fits_by_quart) = names(outcome_list)
+
+invisible(lapply(names(outcome_list), function(outcome){
+  # Extract data of interest
+  x = outcome_list[[outcome]]
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", "kfre_quarts")])
+  
+  # Formula for survfit object
+  form = formula(paste0("Surv(", x["time"], ", " , 
+                        x["status"], ") ~ glyarm"))
+  
+  all_plots = lapply(1:4, function(i){
+    # Subset data to quartile
+    df_sub = df_sub[df_sub$kfre_quarts==i, ]
+    
+    # Plot cumulative incidence curve with risk table
+    if (outcome == "Neph2") {
+      outcome_title = "Development of \nmacro-albuminuria"
+    } else if (outcome == "Neph3") {
+      outcome_title = "Renal failure or ESRD \n(dialysis) or SCr>3.3"
+    } else if (outcome == "egfr40_2consec") {
+      outcome_title = "ESRD or sustained (consecutive) \neGFR reduction of 40%"
+    } else {
+      outcome_title = dat_dict$long[which(dat_dict$short == outcome)]
+    }
+    p1 = ggsurvplot(km_fits_by_quart[[outcome]][[i]], data = df_sub,  censor = FALSE, 
+                    title = paste0(outcome_title, ": \nQuartile ", i), 
+                    conf.int = TRUE, risk.table = TRUE, fun = "event", 
+                    legend.labs = c("Control", "Treatment"))
+    
+    # Create annotation for hazard ratio and 7-year RMST
+    p1$plot = p1$plot + 
+      annotate("label", x = 0, y = Inf, vjust = 1, hjust = 0, 
+               size = 4, fontface = 2, 
+               label = paste0("HR = ", 
+                            est_with_ci_text(coxph_coeff_tabs[[outcome]][1+i,-1]), 
+                            "\n7-year RMST difference\n   = ", 
+                            est_with_ci_text(kfre_quart_rmst_boot_tabs[[outcome]][1+i,-1])))
+    return(p1)
+  })
+  
+  # Modify y-axis limits so that they are the same for all plots
+  y_limits = sapply(all_plots, function(x) {
+    layer_scales(x$plot)$y$range$range
+  })
+  for (i in 1:length(all_plots)) {
+    all_plots[[i]]$plot = all_plots[[i]]$plot + 
+      ylim(min(y_limits[1,]), max(y_limits[2,]))
+  }
+  
+  # Collect all quartile plots for outcome
+  png(paste0("figs_and_tabs/cum_inc_quart_", outcome, ".png"), 
+       res = 100, width = 1200, height = 1200)
+  arrange_ggsurvplots(all_plots, print = TRUE,
+                      nrow = 2, ncol = 2)
+  dev.off()
+  arrange_ggsurvplots(all_plots, print = TRUE,
+                      nrow = 2, ncol = 2)
+}))
+```
+
+```{r}
+# Extract absolute risk for each arm, overall and by quartile
+abs_risk_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Quartile = "Overall", 
+               t(1 - summary(km_fits[[outcome]], times = horizon)$surv)
+               ), 
+    data.frame(Quartile = 1:4, 
+               do.call(rbind, 
+                       lapply(km_fits_by_quart[[outcome]], function(x){
+                         t(1 - summary(x, times = horizon)$surv)
+                         }))
+               ))
+  rownames(out) = NULL
+  colnames(out) = c("Quartile", "Control", "Treatment")
+  return(out)
+})
+names(abs_risk_tabs) = names(outcome_list)
+
+# Function to calculate absolute risk reduction
+calc_arr = function(km_fit, time, alpha = 0.05) {
+  km_fit_summary = summary(km_fit, times = horizon)
+  est = diff(km_fit_summary$surv)
+  se = sqrt(sum(km_fit_summary$std.err^2))
+  return(est + c(0, -1, 1) * qnorm(1 - alpha/2) * se)
+}
+
+# Calculate absolute risk reduction, overall and by quartile
+arr_risk_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Quartile = "Overall", 
+               t(calc_arr(km_fits[[outcome]], time = horizon))
+               ), 
+    data.frame(Quartile = 1:4, 
+               do.call(rbind, 
+                       lapply(km_fits_by_quart[[outcome]], function(x){
+                         t(calc_arr(x, time = horizon))
+                         }))
+               ))
+  rownames(out) = NULL
+  colnames(out) = c("Quartile", "Est", "X2.5.", "X97.5.")
+  return(out)
+})
+names(arr_risk_tabs) = names(outcome_list)
+
+# Extract RMST for each arm, overall and by quartile
+rmst_by_arm_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Quartile = "Overall", 
+               Control = overall_rmst_fits[[outcome]]$RMST.arm0$rmst[[1]], 
+               Treatment = overall_rmst_fits[[outcome]]$RMST.arm1$rmst[[1]]
+               ), 
+    data.frame(Quartile = 1:4, 
+               do.call(rbind, 
+                       lapply(kfre_quart_rmst_fits[[outcome]], function(x){
+                         t(c(Control = x$RMST.arm0$rmst[[1]], 
+                             Treatment = x$RMST.arm1$rmst[[1]]))
+                         }))
+               ))
+  rownames(out) = NULL
+  return(out)
+})
+names(rmst_by_arm_tabs) = names(outcome_list)
+
+# Combine HR, absolute risks, ARR, RMSTs, and RMST difference into table
+all_est_tab = lapply(names(outcome_list), function(outcome){
+  out = data.frame(
+    Quartile = c("Overall", 1:4), 
+    t(sapply(1:5, function(i) {
+      c(est_with_ci_text(coxph_coeff_tabs[[outcome]][i,-1]), 
+        t(round(abs_risk_tabs[[outcome]][i,-1], 2)), 
+        est_with_ci_text(arr_risk_tabs[[outcome]][i,-1]), 
+        t(round(rmst_by_arm_tabs[[outcome]][i,-1], 2)), 
+        est_with_ci_text(kfre_quart_rmst_boot_tabs[[outcome]][i,-1]))
+    }))
+  )
+  rownames(out) = NULL
+  colnames(out) = c("Quartile", "HR (95% CI)", 
+                    "Event rate (control)", "Event rate (treatment)", 
+                    "ARR (95% CI)", 
+                    "RMST (control)", "RMST (treatment)", 
+                    "RMST difference (95% CI)")
+  return(out)
+})
+names(all_est_tab) = names(outcome_list)
+
+# Format table for printing
+est_tab = data.frame(
+  Outcome = rep(names(all_est_tab), 
+                each = nrow(all_est_tab[[1]])), 
+  do.call(rbind, all_est_tab), 
+  row.names = NULL
+)
+est_tab = merge(dat_dict[,c("short", "long")], est_tab, 
+                  by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                  sort = FALSE)[,-1]
+names(est_tab) = c("Outcome", "Quartile", "HR (95% CI)", 
+                   "Event rate (control)", "Event rate (treatment)", 
+                   "ARR (95% CI)", 
+                   "RMST (control)", "RMST (treatment)", 
+                   "RMST difference (95% CI))")
+write.csv(est_tab, 
+          file = "figs_and_tabs/est_tab.csv", row.names = FALSE)
+est_tab
+```
+
+### Deciles
+
+We repeat the HTE analysis using KFRE deciles to define the subgroups. The tables summarize the point estimates and 95% bootstrap CIs for 7-year RMST differences and normalized RMST differences by KFRE decile. 
+
+```{r}
+# kfre decile thresholds
+kfre_dec_thresh = quantile(df$kfre5, seq(0.1, 0.9, by = 0.1))
+# Create groups based on thresholds
+df$kfre_dec = as.numeric(cut(df$kfre5, 
+                             breaks = c(-Inf, as.numeric(kfre_dec_thresh), Inf),
+                             labels = c(1:(length(kfre_dec_thresh)+1))))
+
+# RMST difference by decile
+kfre_dec_rmst = sapply(outcome_list, function(x){
+  df_sub = na.omit(df[,c(x["time"], x["status"], "glyarm", 'kfre_dec')])
+  if (x["status"] == "egfr40_2consec") {
+    horizon = 2282 
+  } else {
+    horizon = 365*7
+  }
+  sapply(1:10, function(i){
+    rmst2(df_sub[df_sub$kfre_dec==i,x["time"]], 
+          df_sub[df_sub$kfre_dec==i,x["status"]], 
+          df_sub[df_sub$kfre_dec==i,"glyarm"], 
+          tau = horizon)$unadjusted.result[1,1]
+  })
+})
+```
+
+```{r, echo = FALSE}
+load("boot_kfre_dec_rmst.rData")
+```
+
+```{r, eval = FALSE}
+boot_kfre_dec_rmst = foreach::foreach(
+  b = 1:B, 
+  .packages = c("survRM2")
+  ) %dopar% {
+    # Set seed
+    set.seed(b)
+    # Create bootstrap sample
+    boot_idx = sample(nrow(df), replace= TRUE)
+    df_boot = df[boot_idx,]
+    
+    # Calculate overall RMST difference
+    overall_rmst = sapply(outcome_list, function(x){
+      df_sub = na.omit(df_boot[,c(x["time"], x["status"], "glyarm", "kfre_dec")])
+      rmst2(df_sub[,x["time"]], 
+            df_sub[,x["status"]], 
+            df_sub[,"glyarm"], 
+            tau = horizon)$unadjusted.result[1,1]
+      })
+    
+    # Calculate RMST difference for each decile
+    kfre_dec_rmst = sapply(outcome_list, function(x){
+      df_sub = na.omit(df_boot[,c(x["time"], x["status"], "glyarm", "kfre_dec")])
+      if (x["status"] == "egfr40_2consec") {
+        horizon = 2282 
+      } else {
+        horizon = 365*7
+      }
+      sapply(1:10, function(i){
+        rmst2(df_sub[df_sub$kfre_dec==i,x["time"]], 
+              df_sub[df_sub$kfre_dec==i,x["status"]], 
+              df_sub[df_sub$kfre_dec==i,"glyarm"], 
+              tau = horizon)$unadjusted.result[1,1]
+      })
+    })
+    return(list(overall_rmst = overall_rmst, 
+                kfre_dec_rmst = kfre_dec_rmst))
+  }
+
+save(boot_kfre_dec_rmst, file = "boot_kfre_dec_rmst.rData")
+```
+
+```{r}
+# Not normalized
+kfre_dec_rmst_boot_ci = lapply(1:10, function(i){
+  dat = sapply(boot_kfre_dec_rmst, function(x){
+    x$kfre_dec_rmst[i,]
+  })
+  apply(dat, 1, quantile, c(0.025, 0.975))
+})
+
+# Make table
+kfre_dec_rmst_boot_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Decile = "Overall", 
+               "Est" = overall_rmst[outcome], 
+               t(kfre_overall_rmst_boot_ci[,outcome])), 
+    data.frame(Decile = 1:10, 
+               "Est" = kfre_dec_rmst[,outcome], 
+               t(sapply(kfre_dec_rmst_boot_ci, function(x){x[,outcome]}))))
+  rownames(out) = NULL
+  return(out)
+})
+names(kfre_dec_rmst_boot_tabs) = names(outcome_list)
+
+# Format table for printing
+rmst_dec_tab = data.frame(
+  Outcome = rep(names(kfre_dec_rmst_boot_tabs), 
+                each = nrow(kfre_dec_rmst_boot_tabs[[1]])), 
+  do.call(rbind, kfre_dec_rmst_boot_tabs), 
+  row.names = NULL
+)
+rmst_dec_tab = merge(dat_dict[,c("short", "long")], rmst_dec_tab, 
+                     by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                     sort = FALSE)[,-1]
+names(rmst_dec_tab) = c("Outcome", "Decile", "Est", "2.5%", "97.5%")
+rmst_dec_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(rmst_dec_tab[,c("Est", "2.5%", "97.5%")], 2)
+write.csv(rmst_dec_tab, 
+          file = "figs_and_tabs/rmst_dec_tab.csv", row.names = FALSE)
+rmst_dec_tab
+
+
+# Normalized (subtract overall RMST difference)
+kfre_dec_rmst_norm_boot_ci = lapply(1:10, function(i){
+  dat = sapply(boot_kfre_dec_rmst, function(x){
+    x$kfre_dec_rmst[i,] - x$overall_rmst
+  })
+  apply(dat, 1, quantile, c(0.025, 0.975))
+})
+
+# Make a table
+kfre_dec_rmst_boot_norm_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Decile = 1:10, 
+               "Est" = kfre_dec_rmst[,outcome] - overall_rmst[outcome], 
+               t(sapply(kfre_dec_rmst_norm_boot_ci, function(x){x[,outcome]}))))
+  rownames(out) = NULL
+  return(out)
+})
+names(kfre_dec_rmst_boot_norm_tabs) = names(outcome_list)
+
+# Format table for printing
+rmst_norm_dec_tab = data.frame(
+  Outcome = rep(names(kfre_dec_rmst_boot_norm_tabs), 
+                each = nrow(kfre_dec_rmst_boot_norm_tabs[[1]])), 
+  do.call(rbind, kfre_dec_rmst_boot_norm_tabs), 
+  row.names = NULL
+)
+rmst_norm_dec_tab = merge(dat_dict[,c("short", "long")], rmst_norm_dec_tab, 
+                          by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                          sort = FALSE)[,-1]
+names(rmst_norm_dec_tab) = c("Outcome", "Decile", "Est", "2.5%", "97.5%")
+rmst_norm_dec_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(rmst_norm_dec_tab[,c("Est", "2.5%", "97.5%")], 2)
+write.csv(rmst_norm_dec_tab, 
+          file = "figs_and_tabs/rmst_norm_dec_tab.csv", row.names = FALSE)
+rmst_norm_dec_tab
+```
+
+RMST differences.
+
+```{r}
+for (outcome in names(kfre_dec_rmst_boot_tabs)) {
+  ate_tab = kfre_dec_rmst_boot_tabs[[outcome]][1,]
+  p1 = kfre_dec_rmst_boot_tabs[[outcome]][-1,] %>% 
+    mutate(x = 1:10) %>% 
+    ggplot(aes(x = x, y = as.numeric(Est))) +
+    geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+    geom_hline(yintercept = ate_tab[,"Est"], color = "grey") + 
+    annotate("rect", xmin = -Inf, xmax = Inf, 
+             ymin = ate_tab[,"X2.5."], ymax = ate_tab[,"X97.5."], 
+             alpha = 0.2) + 
+    scale_x_continuous(breaks = 1:10, labels = 1:10) + 
+    theme(legend.position = 'bottom', legend.box = 'vertical') + 
+    xlab("Decile") + ylab("RMST difference") +
+    ggtitle(dat_dict$long[which(dat_dict$short == outcome)])
+  print(p1)
+  ggsave(paste0("figs_and_tabs/rmst_dec_", outcome, ".png"), 
+         width = 6, height = 4)
+}
+```
+
+Normalized RMST differences. 
+
+```{r}
+for (outcome in names(kfre_dec_rmst_boot_norm_tabs)) {
+  p1 = kfre_dec_rmst_boot_norm_tabs[[outcome]] %>% 
+    mutate(x = 1:10) %>% 
+    ggplot(aes(x = x, y = as.numeric(Est))) +
+    geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+    scale_x_continuous(breaks = 1:10, labels = 1:10) + 
+    theme(legend.position = 'bottom', legend.box = 'vertical') + 
+    xlab("Decile") + ylab("Normalized RMST difference") + 
+    geom_hline(yintercept = 0, color = "grey") + 
+    ggtitle(dat_dict$long[which(dat_dict$short == outcome)])
+  print(p1)
+  ggsave(paste0("figs_and_tabs/rmst_norm_dec_", outcome, ".png"), 
+         width = 6, height = 4)
+}
+```
+
+## Jiang's Diabetic Kidney Disease (DKD) score
+
+We use the score from Jiang (2020) "Establishment and Validation of a Risk Prediction Model for Early Diabetic Kidney Disease Based on a Systematic Review and Meta-Analysis of 20 Cohorts" to define quartile subgroups. There are 1327 missing values, mostly due to missing smoking status. 
+
+```{r}
+# Diabetic retinopathy variable
+baselinehistoryandphyisical = read.csv("/Users/jliang/Library/CloudStorage/Box-Box/RELATE\ CKD/Study\ Datasets/ACCORD/ACCORD_2017b_2\ 2/Main_Study/4-Data_Sets-CRFs/4a-CRF_Data_Sets/csv/f07_baselinehistoryphysicalexam.csv")
+baselinehistoryandphyisical = baselinehistoryandphyisical %>% 
+  mutate(retinopathy = case_when(retpathy==1 | lrtpathy==1 | rrtpathy==1 ~ 1, 
+                                 TRUE ~ 0))
+
+# Merge in diabetic retinopathy and years of diabetes
+df_dkd =  merge(df, 
+            baselinehistoryandphyisical %>% 
+              select(MaskID, retinopathy), 
+            by.x = "maskid", by.y = "MaskID", all.x = TRUE)
+
+# Calculate dkd score from Jiang 2020
+df_dkd = df_dkd %>% 
+  mutate(dkd = case_when(baseline_age <= 49 ~ 0, 
+                         baseline_age <= 59 ~ 3, 
+                         baseline_age > 59 ~ 6) + 
+           case_when(bmi < 25 ~ 0, 
+                     bmi < 30 ~ 1.5, 
+                     bmi >= 30  ~ 3) + 
+           case_when(smokelif == FALSE ~ 0, 
+                     smokelif == TRUE ~ 4) + 
+           case_when(retinopathy == FALSE ~ 0, 
+                     retinopathy == TRUE ~ 3) + 
+           case_when(hba1c < 7 ~ 0, 
+                     hba1c < 8 ~ 1.5, 
+                     hba1c < 9 ~ 3, 
+                     hba1c >= 9 ~ 4.5) + 
+           case_when(sbp < 130 ~ 0, 
+                     sbp < 140 ~ 2, 
+                     sbp < 150 ~ 4, 
+                     sbp >= 150 ~ 6) + 
+           case_when(hdl < 1.3*18 ~ 0, 
+                     hdl >= 1.3*18 ~ 2.5) + 
+           case_when(trig < 1.7*18 ~ 0, 
+                     trig >= 1.7*18 ~ 4)+ 
+           case_when(uacr < 10 ~ 0, 
+                     uacr < 20 ~ 2, 
+                     uacr >= 20 ~ 4))
+
+df_dkd %>% summarise_all(~ sum(is.na(.)))
+
+# Drop NAs
+df_dkd = df_dkd %>% 
+  drop_na(dkd)
+
+# DKD quartile thresholds
+dkd_quart_thresh = quantile(df_dkd$dkd, seq(0.25, 0.75, by = 0.25))
+# Create groups based on thresholds
+df_dkd$dkd_quarts = as.numeric(cut(df_dkd$dkd, 
+                               breaks = c(-Inf, as.numeric(dkd_quart_thresh), Inf),
+                               labels = c(1:(length(dkd_quart_thresh)+1))))
+```
+
+This score seems to be somewhat correlated with 5-year KFRE. 
+
+```{r}
+# Spearman's correlation
+cor(df_dkd$kfre5, df_dkd$dkd, use = "complete.obs", method = "spearman")
+
+# Scatterplot
+df_dkd %>% 
+  ggplot(aes(x = kfre5, y = dkd)) + 
+  geom_point() + 
+  scale_x_log10() + 
+  xlab("5-year predicted risk by KFRE (log)") + ylab("Jiang's DKD score")
+ggsave("figs_and_tabs/dkd_vs_kfre.png", width = 6, height = 5)
+```
+
+Number of observations overall and in each arm, restricting to those with non-missing covariates needed to calculate the DKD score.  
+
+```{r}
+c(table(df_dkd$glyarm), Overall = nrow(df_dkd))
+```
+
+Number of non-missing observations for each outcome. 
+
+```{r}
+t(sapply(outcome_list, function(x) {
+  my_df = na.omit(df_dkd[,c(x["status"], x["time"], "glyarm")])
+  c(table(my_df$glyarm), Overall = nrow(my_df))
+}))
+```
+
+We estimate the 7-year RMST differences for each subgroup defined by the DKD quartiles. 
+
+```{r}
+# Overall
+dkd_overall_rmst = sapply(outcome_list, function(x){
+  df_sub = na.omit(df_dkd[,c(x["time"], x["status"], "glyarm", "dkd_quarts")])
+  rmst2(df_sub[,x["time"]], 
+        df_sub[,x["status"]], 
+        df_sub[,"glyarm"], 
+        tau = horizon)$unadjusted.result[1,1]
+})
+# By quartile
+dkd_quart_rmst = sapply(outcome_list, function(x){
+  df_sub = na.omit(df_dkd[,c(x["time"], x["status"], "glyarm", "dkd_quarts")])
+  if (x["status"] == "egfr40_2consec") {
+    horizon = 2548 
+  } else {
+    horizon = 365*7
+  }
+  sapply(1:4, function(i){
+    rmst2(df_sub[df_sub$dkd_quarts==i,x["time"]], 
+          df_sub[df_sub$dkd_quarts==i,x["status"]], 
+          df_sub[df_sub$dkd_quarts==i,"glyarm"], 
+          tau = horizon)$unadjusted.result[1,1]
+  })
+})
+```
+
+We use 1000 bootstrap samples to obtain confidence intervals for the RMST differences. Tables of the RMST differences and normalized RMST differences (where the overall RMST difference is subtracted from each quartile's estime) with 95% bootstrap CIs are shown below. 
+
+```{r, echo = FALSE}
+load("boot_dkd_rmst.rData")
+```
+
+```{r, eval = FALSE}
+boot_dkd_rmst = foreach::foreach(
+  b = 1:B, 
+  .packages = c("survRM2")
+  ) %dopar% {
+    # Set seed
+    set.seed(b)
+    # Create bootstrap sample
+    boot_idx = sample(nrow(df), replace= TRUE)
+    df_boot = df_dkd[boot_idx,]
+    
+    # Calculate overall RMST difference
+    overall_rmst = sapply(outcome_list, function(x){
+      df_sub = na.omit(df_boot[,c(x["time"], x["status"], "glyarm", "dkd_quarts")])
+      rmst2(df_sub[,x["time"]], 
+            df_sub[,x["status"]], 
+            df_sub[,"glyarm"], 
+            tau = horizon)$unadjusted.result[1,1]
+      })
+    
+    # Calculate RMST difference for each quartile
+    dkd_quart_rmst = sapply(outcome_list, function(x){
+      df_sub = na.omit(df_boot[,c(x["time"], x["status"], "glyarm", "dkd_quarts")])
+      if (x["status"] == "egfr40_2consec") {
+        horizon = 2548 
+      } else {
+        horizon = 365*7
+      }
+      sapply(1:4, function(i){
+        rmst2(df_sub[df_sub$dkd_quarts==i,x["time"]], 
+              df_sub[df_sub$dkd_quarts==i,x["status"]], 
+              df_sub[df_sub$dkd_quarts==i,"glyarm"], 
+              tau = horizon)$unadjusted.result[1,1]
+      })
+    })
+    return(list(overall_rmst = overall_rmst, 
+                dkd_quart_rmst = dkd_quart_rmst))
+  }
+
+save(boot_dkd_rmst, file = "boot_dkd_rmst.rData")
+```
+
+```{r}
+# Overall
+dkd_overall_rmst_boot_ci = apply(
+  sapply(boot_dkd_rmst, function(x){
+    x$overall_rmst
+  }), 1, quantile, c(0.025, 0.975))
+
+# Not normalized
+dkd_quart_rmst_boot_ci = lapply(1:4, function(i){
+  dat = sapply(boot_dkd_rmst, function(x){
+    x$dkd_quart_rmst[i,]
+  })
+  apply(dat, 1, quantile, c(0.025, 0.975))
+})
+
+# Make tables
+dkd_quart_rmst_boot_tabs = lapply(names(outcome_list), function(outcome){
+  out = rbind(
+    data.frame(Quartile = "Overall", 
+               "Est" = dkd_overall_rmst[outcome], 
+               t(dkd_overall_rmst_boot_ci[,outcome])), 
+    data.frame(Quartile = 1:4, 
+               "Est" = dkd_quart_rmst[,outcome], 
+               t(sapply(dkd_quart_rmst_boot_ci, function(x){x[,outcome]}))))
+  rownames(out) = NULL
+  return(out)
+})
+names(dkd_quart_rmst_boot_tabs) = names(outcome_list)
+
+# Format table for printing
+dkd_rmst_tab = data.frame(
+  Outcome = rep(names(dkd_quart_rmst_boot_tabs), 
+                each = nrow(dkd_quart_rmst_boot_tabs[[1]])), 
+  do.call(rbind, dkd_quart_rmst_boot_tabs), 
+  row.names = NULL
+)
+dkd_rmst_tab = merge(dat_dict[,c("short", "long")], dkd_rmst_tab, 
+                     by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                     sort = FALSE)[,-1]
+names(dkd_rmst_tab) = c("Outcome", "Quartile", "Est", "2.5%", "97.5%")
+dkd_rmst_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(dkd_rmst_tab[,c("Est", "2.5%", "97.5%")], 2)
+write.csv(dkd_rmst_tab, 
+          file = "figs_and_tabs/dkd_rmst_tab.csv", row.names = FALSE)
+dkd_rmst_tab
+
+# Normalized (subtract overall RMST difference)
+dkd_quart_rmst_norm_boot_ci = lapply(1:4, function(i){
+  dat = sapply(boot_dkd_rmst, function(x){
+    x$dkd_quart_rmst[i,] - x$overall_rmst
+  })
+  apply(dat, 1, quantile, c(0.025, 0.975))
+})
+
+# Make tables
+dkd_quart_rmst_boot_norm_tabs = lapply(names(outcome_list), function(outcome){
+  data.frame(Quartile = 1:4, 
+             "Est" = dkd_quart_rmst[,outcome] - dkd_overall_rmst[outcome], 
+             t(sapply(dkd_quart_rmst_norm_boot_ci, function(x){x[,outcome]})))
+})
+names(dkd_quart_rmst_boot_norm_tabs) = names(outcome_list)
+
+# Format table for printing
+dkd_rmst_norm_tab = data.frame(
+  Outcome = rep(names(dkd_quart_rmst_boot_norm_tabs), 
+                each = nrow(dkd_quart_rmst_boot_norm_tabs[[1]])), 
+  do.call(rbind, dkd_quart_rmst_boot_norm_tabs), 
+  row.names = NULL
+)
+dkd_rmst_norm_tab = merge(dat_dict[,c("short", "long")], dkd_rmst_norm_tab, 
+                          by.x = "short", by.y = "Outcome", all.y = TRUE, 
+                          sort = FALSE)[,-1]
+names(dkd_rmst_norm_tab) = c("Outcome", "Quartile", "Est", "2.5%", "97.5%")
+dkd_rmst_norm_tab[,c("Est", "2.5%", "97.5%")] = 
+  round(dkd_rmst_norm_tab[,c("Est", "2.5%", "97.5%")], 2)
+write.csv(dkd_rmst_norm_tab, 
+          file = "figs_and_tabs/dkd_rmst_norm_tab.csv", row.names = FALSE)
+dkd_rmst_norm_tab
+```
+
+These are plots of the RMST differences by outcome, with a horizontal reference line drawn at the overall/ATE point estimate. Shading denotes the ATE CI. 
+
+```{r}
+for (outcome in names(dkd_quart_rmst_boot_tabs)) {
+  ate_tab = dkd_quart_rmst_boot_tabs[[outcome]][1,]
+  p1 = dkd_quart_rmst_boot_tabs[[outcome]][-1,] %>% 
+    mutate(x = 1:4) %>% 
+    ggplot(aes(x = x, y = as.numeric(Est))) +
+    geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+    geom_hline(yintercept = ate_tab[,"Est"], color = "grey") + 
+    annotate("rect", xmin = -Inf, xmax = Inf, 
+             ymin = ate_tab[,"X2.5."], ymax = ate_tab[,"X97.5."], 
+             alpha = 0.2) + 
+    scale_x_continuous(breaks = 1:4, labels = 1:4) + 
+    theme(legend.position = 'bottom', legend.box = 'vertical') + 
+    xlab("Quartile") + ylab("RMST difference") +
+    ggtitle(dat_dict$long[which(dat_dict$short == outcome)])
+  print(p1)
+  ggsave(paste0("figs_and_tabs/dkd_rmst_", outcome, ".png"), 
+         width = 6, height = 4)
+}
+```
+
+Normalized RMST differences. 
+
+```{r}
+for (outcome in names(dkd_quart_rmst_boot_norm_tabs)) {
+  p1 = dkd_quart_rmst_boot_norm_tabs[[outcome]] %>% 
+    mutate(x = 1:4) %>% 
+    ggplot(aes(x = x, y = as.numeric(Est))) +
+    geom_pointrange(aes(ymin = X2.5., ymax = X97.5.), size = 0.25) + 
+    scale_x_continuous(breaks = 1:4, labels = 1:4) + 
+    theme(legend.position = 'bottom', legend.box = 'vertical') + 
+    xlab("Quartile") + ylab("Normalized RMST difference") + 
+    geom_hline(yintercept = 0, color = "grey") + 
+    ggtitle(dat_dict$long[which(dat_dict$short == outcome)])
+  print(p1)
+  ggsave(paste0("figs_and_tabs/dkd_rmst_norm_", outcome, ".png"), 
+         width = 6, height = 4)
+}
+```
